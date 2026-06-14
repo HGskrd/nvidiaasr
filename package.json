@@ -1,0 +1,19 @@
+{
+  "name": "nemotron-browser-asr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build"
+  },
+  "dependencies": {
+    "fft.js": "^4.0.4",
+    "lucide": "^0.468.0",
+    "onnxruntime-web": "^1.24.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^6.0.1"
+  }
+}
