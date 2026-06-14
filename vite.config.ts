@@ -170,5 +170,8 @@ function modelCachePlugin(): Plugin {
 }
 
 export default defineConfig({
+  preview: {
+    allowedHosts: ["asr.gskrd.me"]
+  },
   plugins: [modelCachePlugin(), adminPlugin()]
 });
