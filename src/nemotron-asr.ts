@@ -1,5 +1,6 @@
 import * as ort from "onnxruntime-web/webgpu";
 import { StreamingFeatureBuilder } from "./audio";
+import { detectWasmSimd } from "./diagnostics";
 import { ContextGraph, ContextNode, logSoftmax, topTokens } from "./context-biasing";
 import { modelAssetUrls, MODEL_FILES, MODEL_REVISION, NEMOTRON_CONFIG, ORT_RUNTIME_PATH } from "./model-config";
 import { NemotronTokenizer } from "./tokenizer";
@@ -335,6 +336,15 @@ export class NemotronBrowserASR {
   async load(onProgress?: (progress: LoadProgress) => void): Promise<void> {
     if (!("gpu" in navigator)) {
       throw new Error("WebGPU is not available in this browser");
+    }
+
+    // onnxruntime-web's WebGPU backend (JSEP) only ships a SIMD wasm artifact and
+    // hard-throws if WASM SIMD is missing — but only after the model is downloaded.
+    // Probe up front so we fail fast before fetching ~790 MB of weights.
+    if (!detectWasmSimd()) {
+      throw new Error(
+        "WebAssembly SIMD is required but unavailable in this browser. Use a recent desktop Chrome, Edge, or Firefox (not an in-app/embedded browser)."
+      );
     }
 
     ort.env.logLevel = "warning";

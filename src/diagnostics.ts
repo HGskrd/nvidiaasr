@@ -82,6 +82,24 @@ interface UserAgentData {
   getHighEntropyValues?: (hints: string[]) => Promise<Record<string, unknown>>;
 }
 
+// Mirrors onnxruntime-web's own gate: it refuses to create any WebGPU/wasm
+// session unless WebAssembly.validate() accepts a SIMD test module. Probing it
+// ourselves lets us fail fast with a clear message before downloading the model.
+export function detectWasmSimd(): boolean {
+  if (typeof WebAssembly !== "object" || typeof WebAssembly.validate !== "function") return false;
+  try {
+    // Same SIMD feature-detection module ORT validates internally.
+    return WebAssembly.validate(
+      new Uint8Array([
+        0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 10, 30, 1, 28, 0, 65, 0, 253, 15, 253,
+        12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 253, 186, 1, 26, 11
+      ])
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function collectBrowserDiagnostics(): Jsonish {
   const nav = navigator as Navigator & { deviceMemory?: number; gpu?: MinimalGpu; userAgentData?: UserAgentData };
   const audioCtor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -106,6 +124,7 @@ export function collectBrowserDiagnostics(): Jsonish {
       host: window.location.host
     },
     webgpu: Boolean(nav.gpu),
+    wasmSimd: detectWasmSimd(),
     mediaDevices: Boolean(navigator.mediaDevices?.getUserMedia),
     cacheStorage: "caches" in window,
     audioContext: Boolean(audioCtor),

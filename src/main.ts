@@ -2,6 +2,7 @@ import { Copy, Cpu, createIcons, Loader2, Mic, RotateCcw, Square, Trash2, Upload
 import { decodeAudioFile, ModelChunker, StreamingLinearResampler } from "./audio";
 import {
   collectBrowserDiagnostics,
+  detectWasmSimd,
   DiagnosticLevel,
   DiagnosticRecord,
   errorMessage,
@@ -318,9 +319,9 @@ function setState(): void {
 }
 
 function refreshControls(): void {
-  const webGpuAvailable = "gpu" in navigator;
+  const canRun = "gpu" in navigator && detectWasmSimd();
   const busy = isLoading || isStopping || isProcessingFile || Boolean(drainPromise);
-  loadButton.disabled = !webGpuAvailable || isLoaded || busy || isListening;
+  loadButton.disabled = !canRun || isLoaded || busy || isListening;
   micButton.disabled = !isLoaded || isLoading || isProcessingFile || isStopping;
   resetButton.disabled = isLoading || isListening || isStopping || isProcessingFile || Boolean(drainPromise);
   copyLogButton.disabled = logRecords.length === 0;
@@ -715,12 +716,15 @@ appendLog("Session started", "info", {
   modelRevision: MODEL_REVISION
 });
 
-if ("gpu" in navigator) {
-  setStatus("idle", "ready");
-  setDetail("Load the ONNX model");
-} else {
+if (!("gpu" in navigator)) {
   setStatus("error", "no webgpu");
   setDetail("WebGPU is not available in this browser");
+} else if (!detectWasmSimd()) {
+  setStatus("error", "no wasm simd");
+  setDetail("WebAssembly SIMD is unavailable. Use a recent desktop Chrome, Edge, or Firefox.");
+} else {
+  setStatus("idle", "ready");
+  setDetail("Load the ONNX model");
 }
 appendLog("Browser diagnostics", "info", collectBrowserDiagnostics(), { telemetry: false });
 void probeWebGpu((level, message, detail) => appendLog(message, level, detail));
