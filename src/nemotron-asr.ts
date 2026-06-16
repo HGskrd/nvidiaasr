@@ -34,6 +34,14 @@ export interface StreamProgress {
   featureMs: number;
   encoderMs: number;
   decodeMs: number;
+  // Decode breakdown: the joint runs once per encoder frame (and again per
+  // emitted symbol); the decoder LSTM runs once per emitted token (cached across
+  // blank frames). Splitting the two — and counting calls — tells us whether to
+  // attack the joint, the decoder, or the per-call GPU dispatch overhead.
+  jointMs: number;
+  decoderMs: number;
+  jointCalls: number;
+  decoderCalls: number;
   audioPeak: number;
   audioRms: number;
 }
@@ -132,7 +140,7 @@ async function fetchModelFile(
   const cacheKey = modelAssetUrls(filename)[0];
   let cache: Cache | undefined;
 
-  if ("caches" in window) {
+  if ("caches" in globalThis) {
     try {
       cache = await caches.open(MODEL_CACHE_NAME);
       const cached = await cache.match(cacheKey);
@@ -317,6 +325,14 @@ export class NemotronBrowserASR {
   private tokens: number[] = [];
   private decoderOutputCache?: { output: ort.Tensor; hidden: ort.Tensor; cell: ort.Tensor };
 
+  // Per-chunk profiling counters, reset at the top of processChunk and read back
+  // after decode. Incremented inside runJoint / runDecoderState so both the
+  // greedy and beam decoders are covered without per-call-site bookkeeping.
+  private jointMs = 0;
+  private decoderMs = 0;
+  private jointCalls = 0;
+  private decoderCalls = 0;
+
   private biasingEnabled = false;
   private beamSize = 4;
   private boost = 2;
@@ -403,14 +419,14 @@ export class NemotronBrowserASR {
       ort.env.webgpu.profiling = { mode: "default" };
     }
 
-    // The encoder is a heavy conformer where WebGPU's parallelism pays off. The
-    // decoder (small LSTM) and joint (small GEMM) run one tiny op per encoder
-    // frame and per emitted token; on WebGPU each call pays fixed dispatch +
-    // GPU→CPU readback latency that dwarfs the compute, so decode time scales
-    // with token count (~150 ms/token measured on an AMD APU). Running them on
-    // the WASM CPU backend sidesteps the readback stalls. ?provider=wasm forces
-    // everything to WASM; ?hybrid=0 keeps decoder/joint on the encoder provider.
-    const hybrid = (options.hybrid ?? true) && provider === "webgpu";
+    // Hybrid mode runs the small decoder/joint on WASM while the encoder stays
+    // on WebGPU. The theory was that per-call GPU dispatch/readback dominates
+    // their tiny compute — but benchmarking on an AMD APU showed the opposite:
+    // decode was 2.4x SLOWER on WASM (1022 ms vs 423 ms), because the page is
+    // not crossOriginIsolated so WASM runs single-threaded. So hybrid is OFF by
+    // default; ?hybrid=1 opts in (worth retrying once COOP/COEP enables WASM
+    // threads). ?provider=wasm still forces everything to WASM.
+    const hybrid = (options.hybrid ?? false) && provider === "webgpu";
     const encoderProviders: ort.InferenceSession.ExecutionProviderConfig[] =
       provider === "wasm" ? ["wasm"] : ["webgpu"];
     const decodeProviders: ort.InferenceSession.ExecutionProviderConfig[] = hybrid
@@ -492,6 +508,10 @@ export class NemotronBrowserASR {
     featureMs: number;
     encoderMs: number;
     decodeMs: number;
+    jointMs: number;
+    decoderMs: number;
+    jointCalls: number;
+    decoderCalls: number;
     audioPeak: number;
     audioRms: number;
   }> {
@@ -534,13 +554,28 @@ export class NemotronBrowserASR {
       channelLen: encoderOutputs[cfg.outputs.cacheLastChannelLen]
     };
 
+    this.jointMs = 0;
+    this.decoderMs = 0;
+    this.jointCalls = 0;
+    this.decoderCalls = 0;
     const decodeStart = performance.now();
     const decodeStats = await (this.biasingEnabled
       ? this.decodeEncodedFramesBeam(encoded, encodedLen)
       : this.decodeEncodedFrames(encoded, encodedLen));
     const decodeMs = performance.now() - decodeStart;
 
-    return { ...decodeStats, featureMs, encoderMs, decodeMs, audioPeak, audioRms };
+    return {
+      ...decodeStats,
+      featureMs,
+      encoderMs,
+      decodeMs,
+      jointMs: this.jointMs,
+      decoderMs: this.decoderMs,
+      jointCalls: this.jointCalls,
+      decoderCalls: this.decoderCalls,
+      audioPeak,
+      audioRms
+    };
   }
 
   private async decodeEncodedFrames(
@@ -724,11 +759,14 @@ export class NemotronBrowserASR {
   ): Promise<{ output: ort.Tensor; hidden: ort.Tensor; cell: ort.Tensor }> {
     if (!this.sessions) throw new Error("Model is not loaded");
     const cfg = NEMOTRON_CONFIG;
+    const started = performance.now();
     const outputs = await this.sessions.decoder.run({
       [cfg.inputs.decoderTargets]: new ort.Tensor("int64", int64(lastToken), [1, 1]),
       [cfg.inputs.decoderHidden]: hidden,
       [cfg.inputs.decoderCell]: cell
     });
+    this.decoderMs += performance.now() - started;
+    this.decoderCalls += 1;
     return {
       output: outputs[cfg.outputs.decoder],
       hidden: outputs[cfg.outputs.decoderHidden],
@@ -744,10 +782,13 @@ export class NemotronBrowserASR {
   private async runJoint(encoderFrame: ort.Tensor, decoderFrame: ort.Tensor): Promise<ort.Tensor> {
     if (!this.sessions) throw new Error("Model is not loaded");
     const cfg = NEMOTRON_CONFIG;
+    const started = performance.now();
     const outputs = await this.sessions.joint.run({
       [cfg.inputs.joinerEncoder]: encoderFrame,
       [cfg.inputs.joinerDecoder]: decoderFrame
     });
+    this.jointMs += performance.now() - started;
+    this.jointCalls += 1;
     return outputs[cfg.outputs.joint];
   }
 }

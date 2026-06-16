@@ -18,7 +18,8 @@ import {
   MODEL_REVISION,
   NEMOTRON_CONFIG
 } from "./model-config";
-import { LoadOptions, LoadProgress, NemotronBrowserASR, StreamProgress } from "./nemotron-asr";
+import { AsrClient } from "./asr-client";
+import type { LoadOptions, LoadProgress, StreamProgress } from "./nemotron-asr";
 import { telemetry } from "./telemetry";
 import "./styles.css";
 
@@ -161,7 +162,7 @@ const tokenCountEl = document.querySelector<HTMLElement>("#token-count")!;
 const topTokenEl = document.querySelector<HTMLElement>("#top-token")!;
 const blankScoreEl = document.querySelector<HTMLElement>("#blank-score")!;
 
-const asr = new NemotronBrowserASR();
+const asr = new AsrClient();
 const audioQueue: Float32Array[] = [];
 const logRecords: DiagnosticRecord[] = [];
 
@@ -181,6 +182,10 @@ const perf = {
   featureMs: 0,
   encoderMs: 0,
   decodeMs: 0,
+  jointMs: 0,
+  decoderMs: 0,
+  jointCalls: 0,
+  decoderCalls: 0,
   maxQueueDepth: 0
 };
 let drainPromise: Promise<void> | undefined;
@@ -283,11 +288,14 @@ function selectedLangId(): number {
   return Number(languageSelect.value);
 }
 
-function applyBiasing(): void {
+// Posts the bias config to the worker synchronously (so it stays ordered ahead
+// of a following startStream), then logs the phrase counts once the worker
+// replies. Awaiting is optional for callers — ordering holds regardless.
+async function applyBiasing(): Promise<void> {
   const terms = biasTermsInput.value.split("\n").map((line) => line.trim()).filter(Boolean);
   const beamSize = Math.min(8, Math.max(1, Math.round(Number(biasBeamInput.value) || 4)));
   biasBeamInput.value = String(beamSize);
-  const result = asr.setBiasing({ enabled: biasEnabledInput.checked, terms, beamSize });
+  const result = await asr.setBiasing({ enabled: biasEnabledInput.checked, terms, beamSize });
   appendLog("Contextual biasing updated", "info", {
     enabled: biasEnabledInput.checked,
     beamSize,
@@ -314,6 +322,12 @@ function logPerfSummary(): void {
     avgFeatureMs: Math.round(perf.featureMs / perf.chunks),
     avgEncoderMs: Math.round(perf.encoderMs / perf.chunks),
     avgDecodeMs: Math.round(perf.decodeMs / perf.chunks),
+    avgJointMs: Math.round(perf.jointMs / perf.chunks),
+    avgDecoderMs: Math.round(perf.decoderMs / perf.chunks),
+    avgJointCalls: Math.round(perf.jointCalls / perf.chunks),
+    avgDecoderCalls: Math.round(perf.decoderCalls / perf.chunks),
+    msPerJointCall: perf.jointCalls ? Number((perf.jointMs / perf.jointCalls).toFixed(2)) : 0,
+    msPerDecoderCall: perf.decoderCalls ? Number((perf.decoderMs / perf.decoderCalls).toFixed(2)) : 0,
     realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
     encoderShare: Number((perf.encoderMs / perf.elapsedMs).toFixed(2)),
     maxQueueDepth: perf.maxQueueDepth,
@@ -395,6 +409,10 @@ function resetRun(): void {
   perf.featureMs = 0;
   perf.encoderMs = 0;
   perf.decodeMs = 0;
+  perf.jointMs = 0;
+  perf.decoderMs = 0;
+  perf.jointCalls = 0;
+  perf.decoderCalls = 0;
   perf.maxQueueDepth = 0;
   renderTranscript("");
   renderQueue();
@@ -477,6 +495,10 @@ async function drainQueue(): Promise<void> {
       perf.featureMs += progress.featureMs;
       perf.encoderMs += progress.encoderMs;
       perf.decodeMs += progress.decodeMs;
+      perf.jointMs += progress.jointMs;
+      perf.decoderMs += progress.decoderMs;
+      perf.jointCalls += progress.jointCalls;
+      perf.decoderCalls += progress.decoderCalls;
       perf.maxQueueDepth = Math.max(perf.maxQueueDepth, audioQueue.length);
       if (!benchmarkRunning) {
         appendLog(`Chunk ${progress.chunkIndex} complete`, "info", {
@@ -484,6 +506,10 @@ async function drainQueue(): Promise<void> {
           featureMs: Math.round(progress.featureMs),
           encoderMs: Math.round(progress.encoderMs),
           decodeMs: Math.round(progress.decodeMs),
+          jointMs: Math.round(progress.jointMs),
+          decoderMs: Math.round(progress.decoderMs),
+          jointCalls: progress.jointCalls,
+          decoderCalls: progress.decoderCalls,
           audioPeak: Number(progress.audioPeak.toFixed(4)),
           audioRms: Number(progress.audioRms.toFixed(4)),
           tokenCount: progress.tokenCount,
@@ -542,8 +568,9 @@ function benchmarkOptions(): LoadOptions {
   return {
     provider: provider === "wasm" || provider === "webgpu" ? provider : undefined,
     profile: params.get("profile") === "1",
-    // Hybrid (decoder/joint on WASM) is the default; ?hybrid=0 disables it.
-    hybrid: params.get("hybrid") === "0" ? false : undefined
+    // Hybrid (decoder/joint on WASM) is off by default — it lost to pure WebGPU
+    // on the AMD APU while WASM was single-threaded. ?hybrid=1 opts back in.
+    hybrid: params.get("hybrid") === "1" ? true : undefined
   };
 }
 
@@ -577,7 +604,7 @@ async function loadModel(): Promise<void> {
     setDetail("Model loaded");
     appendLog("Ready");
     // Tokenize any bias terms entered before the model (and tokenizer) loaded.
-    applyBiasing();
+    await applyBiasing();
   } catch (error) {
     handleRuntimeError(error, "load failed");
   } finally {
@@ -594,7 +621,7 @@ async function startMic(): Promise<void> {
   }
 
   try {
-    applyBiasing();
+    await applyBiasing();
     beginStream();
     setStatus("busy", "opening mic");
     setDetail("Opening microphone");
@@ -686,7 +713,7 @@ async function processAudioFile(file: File): Promise<void> {
   if (!isLoaded || isProcessingFile || isListening) return;
 
   try {
-    applyBiasing();
+    await applyBiasing();
     beginStream();
     isProcessingFile = true;
     setStatus("busy", "decoding");
@@ -740,12 +767,43 @@ const BENCHMARK_BACKENDS: { label: string; options: LoadOptions }[] = [
   { label: "Pure WASM", options: { provider: "wasm" } }
 ];
 
-// Chunk sizes (ms of audio) tried for every backend. Larger chunks amortize the
-// fixed per-run encoder overhead at the cost of latency.
-const BENCHMARK_CHUNK_MS = [560, 1120, 2240];
+// Chunk sizes (ms of audio) tried for every backend. The encoder was exported
+// with a static 65-frame input (= 560 ms: 9 pre-encode cache + 56 mel frames),
+// so anything else fails OrtRun with "Got invalid dimensions for audio_signal".
+// Only re-add larger sizes here if the model is re-exported with a dynamic time
+// axis (which is the real lever for amortizing per-run encoder overhead).
+const BENCHMARK_CHUNK_MS = [560];
 
 function chunkSamplesForMs(ms: number): number {
   return Math.round((ms / 1000) * NEMOTRON_CONFIG.sampleRate);
+}
+
+// URL overrides so the matrix can be trimmed without a rebuild, e.g.
+// ?benchBackends=webgpu,hybrid (skip the slow Pure WASM pass) or
+// ?benchChunks=560,280 (only meaningful once the encoder is re-exported).
+function benchmarkBackends(): typeof BENCHMARK_BACKENDS {
+  const param = new URLSearchParams(window.location.search).get("benchBackends");
+  if (!param) return BENCHMARK_BACKENDS;
+  const byKey: Record<string, (typeof BENCHMARK_BACKENDS)[number]> = {
+    hybrid: BENCHMARK_BACKENDS[0],
+    webgpu: BENCHMARK_BACKENDS[1],
+    wasm: BENCHMARK_BACKENDS[2]
+  };
+  const chosen = param
+    .split(",")
+    .map((key) => byKey[key.trim().toLowerCase()])
+    .filter((entry): entry is (typeof BENCHMARK_BACKENDS)[number] => Boolean(entry));
+  return chosen.length ? chosen : BENCHMARK_BACKENDS;
+}
+
+function benchmarkChunkMs(): number[] {
+  const param = new URLSearchParams(window.location.search).get("benchChunks");
+  if (!param) return BENCHMARK_CHUNK_MS;
+  const parsed = param
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return parsed.length ? parsed : BENCHMARK_CHUNK_MS;
 }
 
 // Run the decoded audio through the currently loaded sessions at one chunk size
@@ -769,6 +827,10 @@ async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Pr
     avgFeatureMs: Math.round(perf.featureMs / divisor),
     avgEncoderMs: Math.round(perf.encoderMs / divisor),
     avgDecodeMs: Math.round(perf.decodeMs / divisor),
+    avgJointMs: Math.round(perf.jointMs / divisor),
+    avgDecoderMs: Math.round(perf.decoderMs / divisor),
+    msPerJointCall: perf.jointCalls ? Number((perf.jointMs / perf.jointCalls).toFixed(2)) : 0,
+    msPerDecoderCall: perf.decoderCalls ? Number((perf.decoderMs / perf.decoderCalls).toFixed(2)) : 0,
     realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
     maxQueueDepth: perf.maxQueueDepth
   };
@@ -787,13 +849,15 @@ async function runBenchmark(file: File): Promise<void> {
   const results: Record<string, unknown>[] = [];
   const startedAt = performance.now();
   try {
-    applyBiasing();
+    await applyBiasing();
+    const backends = benchmarkBackends();
+    const chunkMsList = benchmarkChunkMs();
     setStatus("busy", "benchmarking");
     setDetail(`Benchmarking ${file.name}`);
     refreshControls();
     appendLog(`Benchmark started for ${file.name}`, "info", {
-      backends: BENCHMARK_BACKENDS.map((b) => b.label),
-      chunkMs: BENCHMARK_CHUNK_MS,
+      backends: backends.map((b) => b.label),
+      chunkMs: chunkMsList,
       bytes: file.size
     });
 
@@ -803,7 +867,7 @@ async function runBenchmark(file: File): Promise<void> {
       durationSeconds: Number((samples.length / NEMOTRON_CONFIG.sampleRate).toFixed(2))
     });
 
-    for (const backend of BENCHMARK_BACKENDS) {
+    for (const backend of backends) {
       setDetail(`Loading ${backend.label}`);
       setState();
       const loadStart = performance.now();
@@ -819,7 +883,7 @@ async function runBenchmark(file: File): Promise<void> {
       const loadMs = Math.round(performance.now() - loadStart);
       appendLog(`Benchmark: loaded ${backend.label}`, "info", { ...backend.options, loadMs });
 
-      for (const chunkMs of BENCHMARK_CHUNK_MS) {
+      for (const chunkMs of chunkMsList) {
         setDetail(`${backend.label} @ ${chunkMs} ms chunks`);
         try {
           const summary = await runBenchmarkPass(samples, chunkSamplesForMs(chunkMs));
