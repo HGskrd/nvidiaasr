@@ -165,6 +165,14 @@ let isListening = false;
 let isStopping = false;
 let isProcessingFile = false;
 let chunkIndex = 0;
+const perf = {
+  chunks: 0,
+  elapsedMs: 0,
+  featureMs: 0,
+  encoderMs: 0,
+  decodeMs: 0,
+  maxQueueDepth: 0
+};
 let drainPromise: Promise<void> | undefined;
 let transcript = "";
 let mediaStream: MediaStream | undefined;
@@ -282,6 +290,27 @@ function countWords(text: string): number {
   return text ? text.split(/\s+/).filter(Boolean).length : 0;
 }
 
+// Single roll-up line for a run so the server log can be pasted wholesale and
+// the timing breakdown read at a glance. realtimeFactor > 1 means we process
+// slower than audio arrives (i.e. we cannot keep up live).
+function logPerfSummary(): void {
+  if (perf.chunks === 0) return;
+  const chunkAudioMs = (NEMOTRON_CONFIG.chunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
+  const avgElapsedMs = perf.elapsedMs / perf.chunks;
+  appendLog("Performance summary", "info", {
+    chunks: perf.chunks,
+    chunkAudioMs: Math.round(chunkAudioMs),
+    avgElapsedMs: Math.round(avgElapsedMs),
+    avgFeatureMs: Math.round(perf.featureMs / perf.chunks),
+    avgEncoderMs: Math.round(perf.encoderMs / perf.chunks),
+    avgDecodeMs: Math.round(perf.decodeMs / perf.chunks),
+    realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
+    encoderShare: Number((perf.encoderMs / perf.elapsedMs).toFixed(2)),
+    maxQueueDepth: perf.maxQueueDepth,
+    provider: "webgpu"
+  });
+}
+
 function renderTranscript(text: string): void {
   transcript = text.trim();
   transcriptEl.textContent = transcript;
@@ -346,6 +375,12 @@ function resetRun(): void {
   chunker.reset();
   audioQueue.length = 0;
   chunkIndex = 0;
+  perf.chunks = 0;
+  perf.elapsedMs = 0;
+  perf.featureMs = 0;
+  perf.encoderMs = 0;
+  perf.decodeMs = 0;
+  perf.maxQueueDepth = 0;
   renderTranscript("");
   renderQueue();
   chunkCountEl.textContent = "0";
@@ -417,8 +452,18 @@ async function drainQueue(): Promise<void> {
       const progress = await asr.acceptAudioChunk(chunk, selectedLangId(), chunkIndex);
       chunkIndex += 1;
       renderProgress(progress);
+      const elapsedMs = Math.round(performance.now() - started);
+      perf.chunks += 1;
+      perf.elapsedMs += elapsedMs;
+      perf.featureMs += progress.featureMs;
+      perf.encoderMs += progress.encoderMs;
+      perf.decodeMs += progress.decodeMs;
+      perf.maxQueueDepth = Math.max(perf.maxQueueDepth, audioQueue.length);
       appendLog(`Chunk ${progress.chunkIndex} complete`, "info", {
-        elapsedMs: Math.round(performance.now() - started),
+        elapsedMs,
+        featureMs: Math.round(progress.featureMs),
+        encoderMs: Math.round(progress.encoderMs),
+        decodeMs: Math.round(progress.decodeMs),
         tokenCount: progress.tokenCount,
         emittedTokens: progress.emittedTokens,
         blankFrames: progress.blankFrames,
@@ -595,6 +640,7 @@ async function stopMic(): Promise<void> {
     chunksProcessed: chunkIndex,
     transcriptWords: countWords(transcript)
   });
+  logPerfSummary();
   refreshControls();
 }
 
@@ -638,6 +684,7 @@ async function processAudioFile(file: File): Promise<void> {
       chunksProcessed: chunkIndex,
       transcriptWords: countWords(transcript)
     });
+    logPerfSummary();
   } catch (error) {
     handleRuntimeError(error, "file failed");
   } finally {

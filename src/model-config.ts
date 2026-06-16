@@ -125,7 +125,7 @@ export function modelAssetUrl(filename: string): string {
 }
 
 export function modelAssetUrls(filename: string): string[] {
-  return [modelAssetUrl(filename), hfUrl(filename)];
+  return [hfUrl(filename), modelAssetUrl(filename)];
 }
 
 export function formatBytes(bytes: number): string {

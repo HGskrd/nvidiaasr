@@ -21,6 +21,9 @@ export interface StreamProgress {
   topToken: number;
   topScore: number;
   blankScore: number;
+  featureMs: number;
+  encoderMs: number;
+  decodeMs: number;
 }
 
 interface SessionBundle {
@@ -404,10 +407,21 @@ export class NemotronBrowserASR {
   private async processChunk(
     chunk: Float32Array,
     langId: number
-  ): Promise<{ emittedTokens: number; blankFrames: number; topToken: number; topScore: number; blankScore: number }> {
+  ): Promise<{
+    emittedTokens: number;
+    blankFrames: number;
+    topToken: number;
+    topScore: number;
+    blankScore: number;
+    featureMs: number;
+    encoderMs: number;
+    decodeMs: number;
+  }> {
     if (!this.sessions) throw new Error("Model is not loaded");
     const cfg = NEMOTRON_CONFIG;
+    const featureStart = performance.now();
     const features = this.featureBuilder.build(chunk);
+    const featureMs = performance.now() - featureStart;
 
     const encoderFeeds: Record<string, ort.Tensor> = {
       [cfg.inputs.encoderAudio]: new ort.Tensor("float32", features.data, features.dims),
@@ -418,7 +432,9 @@ export class NemotronBrowserASR {
       [cfg.inputs.langId]: new ort.Tensor("int64", int64(langId), [1])
     };
 
+    const encoderStart = performance.now();
     const encoderOutputs = await this.sessions.encoder.run(encoderFeeds);
+    const encoderMs = performance.now() - encoderStart;
     const encoded = encoderOutputs[cfg.outputs.encoder];
     const encodedLen = readScalarInt(encoderOutputs[cfg.outputs.encoderLength]);
     this.encoderCache = {
@@ -427,9 +443,13 @@ export class NemotronBrowserASR {
       channelLen: encoderOutputs[cfg.outputs.cacheLastChannelLen]
     };
 
-    return this.biasingEnabled
+    const decodeStart = performance.now();
+    const decodeStats = await (this.biasingEnabled
       ? this.decodeEncodedFramesBeam(encoded, encodedLen)
-      : this.decodeEncodedFrames(encoded, encodedLen);
+      : this.decodeEncodedFrames(encoded, encodedLen));
+    const decodeMs = performance.now() - decodeStart;
+
+    return { ...decodeStats, featureMs, encoderMs, decodeMs };
   }
 
   private async decodeEncodedFrames(
