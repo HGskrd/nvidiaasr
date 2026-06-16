@@ -24,6 +24,8 @@ export interface StreamProgress {
   featureMs: number;
   encoderMs: number;
   decodeMs: number;
+  audioPeak: number;
+  audioRms: number;
 }
 
 interface SessionBundle {
@@ -181,33 +183,46 @@ async function fetchModelFile(
     throw lastError instanceof Error ? lastError : new Error(`Failed to fetch ${filename}`);
   }
 
+  // Persist into Cache Storage by streaming the response body straight to the
+  // cache and then reading the bytes back, instead of buffering the whole file
+  // into a Uint8Array and caching a second copy. For the 690 MB encoder this is
+  // the difference between loading once and re-downloading every reload:
+  //   - peak memory stays low (the body streams to disk, never a 690 MB JS
+  //     allocation), which is what made the download fail outright on phones; and
+  //   - cache.put is atomic, so a dropped connection writes nothing rather than
+  //     leaving a half-file that silently re-downloads next time.
+  if (cache) {
+    try {
+      await cache.put(cacheKey, response);
+      const cached = await cache.match(cacheKey);
+      if (!cached) throw new Error("cache.match returned nothing after put");
+      const bytes = new Uint8Array(await cached.arrayBuffer());
+      onProgress?.({
+        stage: "download",
+        detail: `Downloaded ${filename}`,
+        data: { bytes: bytes.byteLength, elapsedMs: Math.round(performance.now() - started) }
+      });
+      onProgress?.({ stage: "cache", detail: `Cached ${filename}`, data: { bytes: bytes.byteLength } });
+      return bytes;
+    } catch (error) {
+      onProgress?.({
+        stage: "cache",
+        level: "warn",
+        detail: `Could not cache ${filename}; re-fetching uncached for this load`,
+        data: error
+      });
+      console.warn(error);
+      // cache.put consumed the body, so the original response is spent; re-fetch.
+      response = await fetch(response.url);
+    }
+  }
+
   const bytes = new Uint8Array(await response.arrayBuffer());
   onProgress?.({
     stage: "download",
     detail: `Downloaded ${filename}`,
     data: { bytes: bytes.byteLength, elapsedMs: Math.round(performance.now() - started) }
   });
-  if (cache) {
-    try {
-      await cache.put(
-        cacheKey,
-        new Response(bytes, {
-          status: 200,
-          headers: { "content-type": "application/octet-stream" }
-        })
-      );
-      onProgress?.({ stage: "cache", detail: `Cached ${filename}`, data: { bytes: bytes.byteLength } });
-    } catch (error) {
-      onProgress?.({
-        stage: "cache",
-        level: "warn",
-        detail: `Could not cache ${filename}; this load will still continue`,
-        data: error
-      });
-      console.warn(error);
-    }
-  }
-
   return bytes;
 }
 
@@ -416,9 +431,24 @@ export class NemotronBrowserASR {
     featureMs: number;
     encoderMs: number;
     decodeMs: number;
+    audioPeak: number;
+    audioRms: number;
   }> {
     if (!this.sessions) throw new Error("Model is not loaded");
     const cfg = NEMOTRON_CONFIG;
+
+    // Energy of the raw audio reaching the model. If these are ~0 while the user
+    // is speaking, the problem is upstream (wrong/silent mic, capture/resample),
+    // not the decoder — every frame will correctly predict blank on silence.
+    let audioPeak = 0;
+    let sumSquares = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const sample = chunk[i];
+      const abs = sample < 0 ? -sample : sample;
+      if (abs > audioPeak) audioPeak = abs;
+      sumSquares += sample * sample;
+    }
+    const audioRms = Math.sqrt(sumSquares / chunk.length);
     const featureStart = performance.now();
     const features = this.featureBuilder.build(chunk);
     const featureMs = performance.now() - featureStart;
@@ -449,7 +479,7 @@ export class NemotronBrowserASR {
       : this.decodeEncodedFrames(encoded, encodedLen));
     const decodeMs = performance.now() - decodeStart;
 
-    return { ...decodeStats, featureMs, encoderMs, decodeMs };
+    return { ...decodeStats, featureMs, encoderMs, decodeMs, audioPeak, audioRms };
   }
 
   private async decodeEncodedFrames(

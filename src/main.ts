@@ -464,6 +464,8 @@ async function drainQueue(): Promise<void> {
         featureMs: Math.round(progress.featureMs),
         encoderMs: Math.round(progress.encoderMs),
         decodeMs: Math.round(progress.decodeMs),
+        audioPeak: Number(progress.audioPeak.toFixed(4)),
+        audioRms: Number(progress.audioRms.toFixed(4)),
         tokenCount: progress.tokenCount,
         emittedTokens: progress.emittedTokens,
         blankFrames: progress.blankFrames,
