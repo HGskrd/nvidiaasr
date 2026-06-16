@@ -12,6 +12,12 @@ export interface LoadProgress {
   data?: unknown;
 }
 
+// Benchmark knobs, normally absent (production uses the WebGPU defaults).
+export interface LoadOptions {
+  provider?: "webgpu" | "wasm";
+  profile?: boolean;
+}
+
 export interface StreamProgress {
   chunkIndex: number;
   text: string;
@@ -79,6 +85,7 @@ function int64(value: number): BigInt64Array {
 async function createSession(
   modelFile: string,
   externalDataFile: string,
+  executionProviders: ort.InferenceSession.ExecutionProviderConfig[],
   onProgress?: (progress: LoadProgress) => void
 ): Promise<ort.InferenceSession> {
   const modelData = await fetchModelFile(modelFile, onProgress);
@@ -92,7 +99,7 @@ async function createSession(
 
   try {
     const session = await ort.InferenceSession.create(modelData, {
-      executionProviders: ["webgpu"],
+      executionProviders,
       graphOptimizationLevel: "all",
       externalData: [{ path: externalDataFile, data: externalData }]
     });
@@ -351,8 +358,10 @@ export class NemotronBrowserASR {
     };
   }
 
-  async load(onProgress?: (progress: LoadProgress) => void): Promise<void> {
-    if (!("gpu" in navigator)) {
+  async load(onProgress?: (progress: LoadProgress) => void, options: LoadOptions = {}): Promise<void> {
+    const provider = options.provider ?? "webgpu";
+
+    if (provider === "webgpu" && !("gpu" in navigator)) {
       throw new Error("WebGPU is not available in this browser");
     }
 
@@ -366,26 +375,43 @@ export class NemotronBrowserASR {
     }
 
     ort.env.logLevel = "warning";
-    if (import.meta.env.DEV) {
+    // The WASM artifacts are served at ORT_RUNTIME_PATH by the (preview) server,
+    // so point ORT there in dev and whenever the WASM provider is benchmarked.
+    if (import.meta.env.DEV || provider === "wasm") {
       ort.env.wasm.wasmPaths = ORT_RUNTIME_PATH;
     }
 
+    // Benchmark knob: WebGPU per-kernel timings are printed to the console so we
+    // can see which encoder ops dominate instead of treating it as a black box.
+    if (options.profile && provider === "webgpu") {
+      ort.env.webgpu.profiling = { mode: "default" };
+    }
+
+    const executionProviders: ort.InferenceSession.ExecutionProviderConfig[] =
+      provider === "wasm" ? ["wasm"] : ["webgpu"];
+
     onProgress?.({
       stage: "runtime",
-      detail: "ONNX Runtime configured for WebGPU only",
-      data: { wasmPaths: import.meta.env.DEV ? ORT_RUNTIME_PATH : "bundled" }
+      detail: `ONNX Runtime configured for ${provider}`,
+      data: {
+        provider,
+        profile: Boolean(options.profile),
+        crossOriginIsolated: globalThis.crossOriginIsolated,
+        wasmThreads: ort.env.wasm.numThreads,
+        wasmPaths: import.meta.env.DEV ? ORT_RUNTIME_PATH : "bundled"
+      }
     });
 
     this.tokenizer = await NemotronTokenizer.fromHuggingFace(onProgress);
 
     onProgress?.({ stage: "decoder", detail: "Loading decoder.onnx and decoder.onnx.data" });
-    const decoder = await createSession(MODEL_FILES.decoder.onnx, MODEL_FILES.decoder.data, onProgress);
+    const decoder = await createSession(MODEL_FILES.decoder.onnx, MODEL_FILES.decoder.data, executionProviders, onProgress);
 
     onProgress?.({ stage: "joint", detail: "Loading joint.onnx and joint.onnx.data" });
-    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, onProgress);
+    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, executionProviders, onProgress);
 
     onProgress?.({ stage: "encoder", detail: "Loading encoder.onnx and encoder.onnx.data" });
-    const encoder = await createSession(MODEL_FILES.encoder.onnx, MODEL_FILES.encoder.data, onProgress);
+    const encoder = await createSession(MODEL_FILES.encoder.onnx, MODEL_FILES.encoder.data, executionProviders, onProgress);
 
     this.sessions = { encoder, decoder, joint };
     onProgress?.({ stage: "ready", detail: "All ONNX sessions loaded" });

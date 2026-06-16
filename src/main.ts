@@ -18,7 +18,7 @@ import {
   MODEL_REVISION,
   NEMOTRON_CONFIG
 } from "./model-config";
-import { LoadProgress, NemotronBrowserASR, StreamProgress } from "./nemotron-asr";
+import { LoadOptions, LoadProgress, NemotronBrowserASR, StreamProgress } from "./nemotron-asr";
 import { telemetry } from "./telemetry";
 import "./styles.css";
 
@@ -307,7 +307,7 @@ function logPerfSummary(): void {
     realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
     encoderShare: Number((perf.encoderMs / perf.elapsedMs).toFixed(2)),
     maxQueueDepth: perf.maxQueueDepth,
-    provider: "webgpu"
+    provider: benchmarkOptions().provider ?? "webgpu"
   });
 }
 
@@ -513,9 +513,21 @@ function closeAudioInput(): void {
   resampler = undefined;
 }
 
+// Benchmark knobs read from the URL, e.g. ?provider=wasm&profile=1. Absent in
+// normal use, so production keeps the WebGPU defaults.
+function benchmarkOptions(): LoadOptions {
+  const params = new URLSearchParams(window.location.search);
+  const provider = params.get("provider");
+  return {
+    provider: provider === "wasm" || provider === "webgpu" ? provider : undefined,
+    profile: params.get("profile") === "1"
+  };
+}
+
 async function loadModel(): Promise<void> {
   if (isLoaded || isLoading) return;
 
+  const options = benchmarkOptions();
   isLoading = true;
   setStatus("busy", "loading");
   setDetail("Loading Nemotron ONNX weights");
@@ -523,7 +535,8 @@ async function loadModel(): Promise<void> {
     modelId: MODEL_ID,
     modelRevision: MODEL_REVISION,
     totalWeightBytes: modelBytes,
-    provider: "webgpu"
+    provider: options.provider ?? "webgpu",
+    profile: options.profile
   });
   refreshControls();
 
@@ -534,7 +547,7 @@ async function loadModel(): Promise<void> {
       const detail = progress.detail ?? progress.stage;
       setDetail(detail);
       appendLog(`[${progress.stage}] ${detail}`, progress.level ?? "info", progress.data);
-    });
+    }, options);
 
     isLoaded = true;
     setStatus("ok", "ready");
