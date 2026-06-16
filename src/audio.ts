@@ -46,19 +46,25 @@ export class StreamingLinearResampler {
 
 export class ModelChunker {
   private pending = new Float32Array(0);
+  private readonly chunkSamples: number;
+
+  // chunkSamples is configurable so the benchmark can sweep larger chunks
+  // (amortizing per-run encoder overhead) without touching the global config.
+  constructor(chunkSamples: number = NEMOTRON_CONFIG.chunkSamples) {
+    this.chunkSamples = chunkSamples;
+  }
 
   push(samples: Float32Array): Float32Array[] {
     if (samples.length === 0) return [];
-    const cfg = NEMOTRON_CONFIG;
     const source = new Float32Array(this.pending.length + samples.length);
     source.set(this.pending);
     source.set(samples, this.pending.length);
 
     const chunks: Float32Array[] = [];
     let offset = 0;
-    while (offset + cfg.chunkSamples <= source.length) {
-      chunks.push(source.slice(offset, offset + cfg.chunkSamples));
-      offset += cfg.chunkSamples;
+    while (offset + this.chunkSamples <= source.length) {
+      chunks.push(source.slice(offset, offset + this.chunkSamples));
+      offset += this.chunkSamples;
     }
 
     this.pending = source.slice(offset);
@@ -67,7 +73,7 @@ export class ModelChunker {
 
   flushPadded(): Float32Array | undefined {
     if (this.pending.length === 0) return undefined;
-    const chunk = new Float32Array(NEMOTRON_CONFIG.chunkSamples);
+    const chunk = new Float32Array(this.chunkSamples);
     chunk.set(this.pending);
     this.pending = new Float32Array(0);
     return chunk;

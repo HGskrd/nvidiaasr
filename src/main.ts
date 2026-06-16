@@ -1,4 +1,4 @@
-import { Copy, Cpu, createIcons, Loader2, Mic, RotateCcw, Square, Trash2, Upload } from "lucide";
+import { Copy, Cpu, createIcons, Gauge, Loader2, Mic, RotateCcw, Square, Trash2, Upload } from "lucide";
 import { decodeAudioFile, ModelChunker, StreamingLinearResampler } from "./audio";
 import {
   collectBrowserDiagnostics,
@@ -69,6 +69,11 @@ app.innerHTML = `
           <span>Audio File</span>
           <input id="audio-file" type="file" accept="audio/*" />
         </label>
+        <label class="file-control" for="benchmark-file" title="Run the file through every backend and chunk size">
+          <i data-lucide="gauge"></i>
+          <span>Benchmark</span>
+          <input id="benchmark-file" type="file" accept="audio/*" />
+        </label>
       </div>
     </section>
 
@@ -129,7 +134,7 @@ app.innerHTML = `
   </main>
 `;
 
-createIcons({ icons: { Copy, Cpu, Loader2, Mic, RotateCcw, Square, Trash2, Upload } });
+createIcons({ icons: { Copy, Cpu, Gauge, Loader2, Mic, RotateCcw, Square, Trash2, Upload } });
 
 const statusEl = document.querySelector<HTMLDivElement>("#status")!;
 const detailEl = document.querySelector<HTMLParagraphElement>("#detail")!;
@@ -140,6 +145,7 @@ const micLabel = micButton.querySelector("span")!;
 const resetButton = document.querySelector<HTMLButtonElement>("#reset")!;
 const languageSelect = document.querySelector<HTMLSelectElement>("#language")!;
 const fileInput = document.querySelector<HTMLInputElement>("#audio-file")!;
+const benchmarkFileInput = document.querySelector<HTMLInputElement>("#benchmark-file")!;
 const biasEnabledInput = document.querySelector<HTMLInputElement>("#bias-enabled")!;
 const biasTermsInput = document.querySelector<HTMLTextAreaElement>("#bias-terms")!;
 const biasBeamInput = document.querySelector<HTMLInputElement>("#bias-beam")!;
@@ -164,6 +170,10 @@ let isLoaded = false;
 let isListening = false;
 let isStopping = false;
 let isProcessingFile = false;
+let benchmarkRunning = false;
+// Samples per chunk for the active run. Normally the model default; the
+// benchmark overrides it per pass to sweep larger chunks.
+let activeChunkSamples: number = NEMOTRON_CONFIG.chunkSamples;
 let chunkIndex = 0;
 const perf = {
   chunks: 0,
@@ -295,7 +305,7 @@ function countWords(text: string): number {
 // slower than audio arrives (i.e. we cannot keep up live).
 function logPerfSummary(): void {
   if (perf.chunks === 0) return;
-  const chunkAudioMs = (NEMOTRON_CONFIG.chunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
+  const chunkAudioMs = (activeChunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
   const avgElapsedMs = perf.elapsedMs / perf.chunks;
   appendLog("Performance summary", "info", {
     chunks: perf.chunks,
@@ -332,7 +342,9 @@ function renderQueue(): void {
 }
 
 function setState(): void {
-  if (isLoading) {
+  if (benchmarkRunning) {
+    stateEl.textContent = "Benchmarking";
+  } else if (isLoading) {
     stateEl.textContent = "Loading";
   } else if (isStopping) {
     stateEl.textContent = "Stopping";
@@ -349,16 +361,19 @@ function setState(): void {
 
 function refreshControls(): void {
   const canRun = "gpu" in navigator && detectWasmSimd();
-  const busy = isLoading || isStopping || isProcessingFile || Boolean(drainPromise);
+  const busy = isLoading || isStopping || isProcessingFile || benchmarkRunning || Boolean(drainPromise);
   loadButton.disabled = !canRun || isLoaded || busy || isListening;
-  micButton.disabled = !isLoaded || isLoading || isProcessingFile || isStopping;
-  resetButton.disabled = isLoading || isListening || isStopping || isProcessingFile || Boolean(drainPromise);
+  micButton.disabled = !isLoaded || isLoading || isProcessingFile || isStopping || benchmarkRunning;
+  resetButton.disabled = busy || isListening;
   copyLogButton.disabled = logRecords.length === 0;
   clearLogButton.disabled = logRecords.length === 0;
-  languageSelect.disabled = isLoading || isListening || isProcessingFile || Boolean(drainPromise);
-  fileInput.disabled = !isLoaded || isLoading || isListening || isStopping || Boolean(drainPromise);
+  languageSelect.disabled = isLoading || isListening || isProcessingFile || benchmarkRunning || Boolean(drainPromise);
+  fileInput.disabled = !isLoaded || isLoading || isListening || isStopping || benchmarkRunning || Boolean(drainPromise);
+  // The benchmark loads its own sessions, so it doesn't require a pre-loaded
+  // model; it only needs a capable browser and nothing else running.
+  benchmarkFileInput.disabled = !canRun || isListening || busy;
 
-  const biasLocked = isLoading || isListening || isStopping || isProcessingFile || Boolean(drainPromise);
+  const biasLocked = isLoading || isListening || isStopping || isProcessingFile || benchmarkRunning || Boolean(drainPromise);
   biasEnabledInput.disabled = biasLocked;
   biasTermsInput.disabled = biasLocked;
   biasBeamInput.disabled = biasLocked;
@@ -440,16 +455,20 @@ async function drainQueue(): Promise<void> {
       const chunk = audioQueue.shift();
       if (!chunk) continue;
       renderQueue();
-      setStatus("busy", "processing");
+      setStatus("busy", benchmarkRunning ? "benchmarking" : "processing");
       setDetail("Running Nemotron ONNX inference");
       const started = performance.now();
-      appendLog(
-        `Processing chunk ${chunkIndex}`,
-        "info",
-        { langId: selectedLangId(), samples: chunk.length, queueDepth: audioQueue.length },
-        { telemetry: false }
-      );
-      const progress = await asr.acceptAudioChunk(chunk, selectedLangId(), chunkIndex);
+      // During a benchmark this loop runs hundreds of chunks across 9 passes;
+      // skip the per-chunk log spam (and telemetry) and keep only the summaries.
+      if (!benchmarkRunning) {
+        appendLog(
+          `Processing chunk ${chunkIndex}`,
+          "info",
+          { langId: selectedLangId(), samples: chunk.length, queueDepth: audioQueue.length },
+          { telemetry: false }
+        );
+      }
+      const progress = await asr.acceptAudioChunk(chunk, selectedLangId(), chunkIndex, activeChunkSamples);
       chunkIndex += 1;
       renderProgress(progress);
       const elapsedMs = Math.round(performance.now() - started);
@@ -459,20 +478,22 @@ async function drainQueue(): Promise<void> {
       perf.encoderMs += progress.encoderMs;
       perf.decodeMs += progress.decodeMs;
       perf.maxQueueDepth = Math.max(perf.maxQueueDepth, audioQueue.length);
-      appendLog(`Chunk ${progress.chunkIndex} complete`, "info", {
-        elapsedMs,
-        featureMs: Math.round(progress.featureMs),
-        encoderMs: Math.round(progress.encoderMs),
-        decodeMs: Math.round(progress.decodeMs),
-        audioPeak: Number(progress.audioPeak.toFixed(4)),
-        audioRms: Number(progress.audioRms.toFixed(4)),
-        tokenCount: progress.tokenCount,
-        emittedTokens: progress.emittedTokens,
-        blankFrames: progress.blankFrames,
-        topToken: progress.topToken,
-        topScore: progress.topScore,
-        blankScore: progress.blankScore
-      });
+      if (!benchmarkRunning) {
+        appendLog(`Chunk ${progress.chunkIndex} complete`, "info", {
+          elapsedMs,
+          featureMs: Math.round(progress.featureMs),
+          encoderMs: Math.round(progress.encoderMs),
+          decodeMs: Math.round(progress.decodeMs),
+          audioPeak: Number(progress.audioPeak.toFixed(4)),
+          audioRms: Number(progress.audioRms.toFixed(4)),
+          tokenCount: progress.tokenCount,
+          emittedTokens: progress.emittedTokens,
+          blankFrames: progress.blankFrames,
+          topToken: progress.topToken,
+          topScore: progress.topScore,
+          blankScore: progress.blankScore
+        });
+      }
     }
 
     renderQueue();
@@ -520,7 +541,9 @@ function benchmarkOptions(): LoadOptions {
   const provider = params.get("provider");
   return {
     provider: provider === "wasm" || provider === "webgpu" ? provider : undefined,
-    profile: params.get("profile") === "1"
+    profile: params.get("profile") === "1",
+    // Hybrid (decoder/joint on WASM) is the default; ?hybrid=0 disables it.
+    hybrid: params.get("hybrid") === "0" ? false : undefined
   };
 }
 
@@ -708,6 +731,135 @@ async function processAudioFile(file: File): Promise<void> {
   }
 }
 
+// Backend configurations swept by the benchmark. Each one rebuilds the ONNX
+// sessions (the expensive step), so they are the outer loop; chunk sizes re-run
+// the same sessions and are the inner loop.
+const BENCHMARK_BACKENDS: { label: string; options: LoadOptions }[] = [
+  { label: "Hybrid WebGPU (encoder webgpu / decode wasm)", options: { provider: "webgpu", hybrid: true } },
+  { label: "Pure WebGPU", options: { provider: "webgpu", hybrid: false } },
+  { label: "Pure WASM", options: { provider: "wasm" } }
+];
+
+// Chunk sizes (ms of audio) tried for every backend. Larger chunks amortize the
+// fixed per-run encoder overhead at the cost of latency.
+const BENCHMARK_CHUNK_MS = [560, 1120, 2240];
+
+function chunkSamplesForMs(ms: number): number {
+  return Math.round((ms / 1000) * NEMOTRON_CONFIG.sampleRate);
+}
+
+// Run the decoded audio through the currently loaded sessions at one chunk size
+// and return the timing summary for that pass.
+async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Promise<Record<string, number>> {
+  activeChunkSamples = chunkSamples;
+  beginStream();
+  const passChunker = new ModelChunker(chunkSamples);
+  enqueueChunks(passChunker.push(samples));
+  const finalChunk = passChunker.flushPadded();
+  if (finalChunk) enqueueChunks([finalChunk]);
+  await drainQueue();
+
+  const chunkAudioMs = (chunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
+  const divisor = Math.max(1, perf.chunks);
+  const avgElapsedMs = perf.elapsedMs / divisor;
+  return {
+    chunkMs: Math.round(chunkAudioMs),
+    chunks: perf.chunks,
+    avgElapsedMs: Math.round(avgElapsedMs),
+    avgFeatureMs: Math.round(perf.featureMs / divisor),
+    avgEncoderMs: Math.round(perf.encoderMs / divisor),
+    avgDecodeMs: Math.round(perf.decodeMs / divisor),
+    realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
+    maxQueueDepth: perf.maxQueueDepth
+  };
+}
+
+async function runBenchmark(file: File): Promise<void> {
+  if (benchmarkRunning || isListening || isProcessingFile || isLoading || Boolean(drainPromise)) return;
+  if (!("gpu" in navigator) || !detectWasmSimd()) {
+    handleRuntimeError(new Error("WebGPU + WASM SIMD are required to benchmark"), "benchmark unavailable");
+    return;
+  }
+
+  benchmarkRunning = true;
+  // The previous manual load (if any) is about to be replaced backend-by-backend.
+  isLoaded = false;
+  const results: Record<string, unknown>[] = [];
+  const startedAt = performance.now();
+  try {
+    applyBiasing();
+    setStatus("busy", "benchmarking");
+    setDetail(`Benchmarking ${file.name}`);
+    refreshControls();
+    appendLog(`Benchmark started for ${file.name}`, "info", {
+      backends: BENCHMARK_BACKENDS.map((b) => b.label),
+      chunkMs: BENCHMARK_CHUNK_MS,
+      bytes: file.size
+    });
+
+    const samples = await decodeAudioFile(file);
+    appendLog("Benchmark audio decoded", "info", {
+      samples: samples.length,
+      durationSeconds: Number((samples.length / NEMOTRON_CONFIG.sampleRate).toFixed(2))
+    });
+
+    for (const backend of BENCHMARK_BACKENDS) {
+      setDetail(`Loading ${backend.label}`);
+      setState();
+      const loadStart = performance.now();
+      try {
+        await asr.load((progress: LoadProgress) => {
+          setDetail(`${backend.label}: ${progress.detail ?? progress.stage}`);
+        }, backend.options);
+      } catch (error) {
+        appendErrorLog(`Benchmark: failed to load ${backend.label}`, error);
+        results.push({ backend: backend.label, status: "load failed", error: errorMessage(error) });
+        continue;
+      }
+      const loadMs = Math.round(performance.now() - loadStart);
+      appendLog(`Benchmark: loaded ${backend.label}`, "info", { ...backend.options, loadMs });
+
+      for (const chunkMs of BENCHMARK_CHUNK_MS) {
+        setDetail(`${backend.label} @ ${chunkMs} ms chunks`);
+        try {
+          const summary = await runBenchmarkPass(samples, chunkSamplesForMs(chunkMs));
+          const row = { backend: backend.label, status: "ok", loadMs, ...summary };
+          results.push(row);
+          appendLog(`Benchmark: ${backend.label} @ ${chunkMs} ms`, "info", row);
+        } catch (error) {
+          appendErrorLog(`Benchmark: run failed for ${backend.label} @ ${chunkMs} ms`, error);
+          results.push({ backend: backend.label, chunkMs, status: "run failed", error: errorMessage(error) });
+        }
+      }
+    }
+
+    // Single roll-up record: copy the diagnostic log and the whole matrix is in
+    // one place, sorted best-RTF-first.
+    const ranked = [...results].sort((a, b) => {
+      const ra = typeof a.realtimeFactor === "number" ? a.realtimeFactor : Number.POSITIVE_INFINITY;
+      const rb = typeof b.realtimeFactor === "number" ? b.realtimeFactor : Number.POSITIVE_INFINITY;
+      return ra - rb;
+    });
+    appendLog("Benchmark complete", "info", {
+      file: file.name,
+      totalMs: Math.round(performance.now() - startedAt),
+      best: ranked[0],
+      results: ranked
+    });
+  } catch (error) {
+    handleRuntimeError(error, "benchmark failed");
+  } finally {
+    activeChunkSamples = NEMOTRON_CONFIG.chunkSamples;
+    benchmarkRunning = false;
+    isLoaded = asr.isLoaded;
+    if (isLoaded) {
+      setStatus("ok", "ready");
+      setDetail("Benchmark finished");
+    }
+    refreshControls();
+  }
+}
+
 loadButton.addEventListener("click", () => {
   void loadModel();
 });
@@ -750,6 +902,12 @@ fileInput.addEventListener("change", () => {
   const file = fileInput.files?.[0];
   fileInput.value = "";
   if (file) void processAudioFile(file);
+});
+
+benchmarkFileInput.addEventListener("change", () => {
+  const file = benchmarkFileInput.files?.[0];
+  benchmarkFileInput.value = "";
+  if (file) void runBenchmark(file);
 });
 
 window.addEventListener("error", (event) => {

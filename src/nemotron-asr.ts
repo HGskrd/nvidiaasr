@@ -16,6 +16,10 @@ export interface LoadProgress {
 export interface LoadOptions {
   provider?: "webgpu" | "wasm";
   profile?: boolean;
+  // Run the small decoder/joint sessions on WASM while the encoder stays on
+  // WebGPU. Defaults on; set false (?hybrid=0) to keep every session on the
+  // chosen provider for an A/B comparison.
+  hybrid?: boolean;
 }
 
 export interface StreamProgress {
@@ -91,9 +95,10 @@ async function createSession(
   const modelData = await fetchModelFile(modelFile, onProgress);
   const externalData = await fetchModelFile(externalDataFile, onProgress);
   const started = performance.now();
+  const providerLabel = executionProviders.map((p) => (typeof p === "string" ? p : p.name)).join("+");
   onProgress?.({
     stage: "session",
-    detail: `Creating ONNX WebGPU session for ${modelFile}`,
+    detail: `Creating ONNX ${providerLabel} session for ${modelFile}`,
     data: { modelBytes: modelData.byteLength, externalDataBytes: externalData.byteLength }
   });
 
@@ -105,7 +110,7 @@ async function createSession(
     });
     onProgress?.({
       stage: "session",
-      detail: `Created ONNX WebGPU session for ${modelFile}`,
+      detail: `Created ONNX ${providerLabel} session for ${modelFile}`,
       data: { elapsedMs: Math.round(performance.now() - started) }
     });
     return session;
@@ -113,7 +118,7 @@ async function createSession(
     onProgress?.({
       stage: "session",
       level: "error",
-      detail: `Failed to create ONNX WebGPU session for ${modelFile}`,
+      detail: `Failed to create ONNX ${providerLabel} session for ${modelFile}`,
       data: error
     });
     throw error;
@@ -358,7 +363,18 @@ export class NemotronBrowserASR {
     };
   }
 
+  // Release the current ONNX sessions and their GPU/WASM buffers. The benchmark
+  // rebuilds sessions per backend, so the old ones must be freed first to avoid
+  // holding two copies of the ~690 MB encoder.
+  async dispose(): Promise<void> {
+    if (!this.sessions) return;
+    const { encoder, decoder, joint } = this.sessions;
+    this.sessions = undefined;
+    await Promise.all([encoder.release(), decoder.release(), joint.release()]);
+  }
+
   async load(onProgress?: (progress: LoadProgress) => void, options: LoadOptions = {}): Promise<void> {
+    await this.dispose();
     const provider = options.provider ?? "webgpu";
 
     if (provider === "webgpu" && !("gpu" in navigator)) {
@@ -387,14 +403,28 @@ export class NemotronBrowserASR {
       ort.env.webgpu.profiling = { mode: "default" };
     }
 
-    const executionProviders: ort.InferenceSession.ExecutionProviderConfig[] =
+    // The encoder is a heavy conformer where WebGPU's parallelism pays off. The
+    // decoder (small LSTM) and joint (small GEMM) run one tiny op per encoder
+    // frame and per emitted token; on WebGPU each call pays fixed dispatch +
+    // GPU→CPU readback latency that dwarfs the compute, so decode time scales
+    // with token count (~150 ms/token measured on an AMD APU). Running them on
+    // the WASM CPU backend sidesteps the readback stalls. ?provider=wasm forces
+    // everything to WASM; ?hybrid=0 keeps decoder/joint on the encoder provider.
+    const hybrid = (options.hybrid ?? true) && provider === "webgpu";
+    const encoderProviders: ort.InferenceSession.ExecutionProviderConfig[] =
       provider === "wasm" ? ["wasm"] : ["webgpu"];
+    const decodeProviders: ort.InferenceSession.ExecutionProviderConfig[] = hybrid
+      ? ["wasm"]
+      : encoderProviders;
 
     onProgress?.({
       stage: "runtime",
-      detail: `ONNX Runtime configured for ${provider}`,
+      detail: `ONNX Runtime configured for ${provider}${hybrid ? " (hybrid: decoder/joint on wasm)" : ""}`,
       data: {
         provider,
+        hybrid,
+        encoderProviders,
+        decodeProviders,
         profile: Boolean(options.profile),
         crossOriginIsolated: globalThis.crossOriginIsolated,
         wasmThreads: ort.env.wasm.numThreads,
@@ -405,13 +435,13 @@ export class NemotronBrowserASR {
     this.tokenizer = await NemotronTokenizer.fromHuggingFace(onProgress);
 
     onProgress?.({ stage: "decoder", detail: "Loading decoder.onnx and decoder.onnx.data" });
-    const decoder = await createSession(MODEL_FILES.decoder.onnx, MODEL_FILES.decoder.data, executionProviders, onProgress);
+    const decoder = await createSession(MODEL_FILES.decoder.onnx, MODEL_FILES.decoder.data, decodeProviders, onProgress);
 
     onProgress?.({ stage: "joint", detail: "Loading joint.onnx and joint.onnx.data" });
-    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, executionProviders, onProgress);
+    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, decodeProviders, onProgress);
 
     onProgress?.({ stage: "encoder", detail: "Loading encoder.onnx and encoder.onnx.data" });
-    const encoder = await createSession(MODEL_FILES.encoder.onnx, MODEL_FILES.encoder.data, executionProviders, onProgress);
+    const encoder = await createSession(MODEL_FILES.encoder.onnx, MODEL_FILES.encoder.data, encoderProviders, onProgress);
 
     this.sessions = { encoder, decoder, joint };
     onProgress?.({ stage: "ready", detail: "All ONNX sessions loaded" });
@@ -431,11 +461,16 @@ export class NemotronBrowserASR {
     this.reset();
   }
 
-  async acceptAudioChunk(chunk: Float32Array, langId: number, chunkIndex: number): Promise<StreamProgress> {
+  async acceptAudioChunk(
+    chunk: Float32Array,
+    langId: number,
+    chunkIndex: number,
+    chunkSamples: number = NEMOTRON_CONFIG.chunkSamples
+  ): Promise<StreamProgress> {
     if (!this.sessions) throw new Error("Model is not loaded");
     if (!this.tokenizer) throw new Error("Tokenizer is not loaded");
-    const normalizedChunk = new Float32Array(NEMOTRON_CONFIG.chunkSamples);
-    normalizedChunk.set(chunk.subarray(0, NEMOTRON_CONFIG.chunkSamples));
+    const normalizedChunk = new Float32Array(chunkSamples);
+    normalizedChunk.set(chunk.subarray(0, chunkSamples));
     const stats = await this.processChunk(normalizedChunk, langId);
     return {
       chunkIndex,
