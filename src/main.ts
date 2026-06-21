@@ -179,6 +179,7 @@ let chunkIndex = 0;
 const perf = {
   chunks: 0,
   elapsedMs: 0,
+  chunkElapsedMs: [] as number[],
   featureMs: 0,
   encoderMs: 0,
   decodeMs: 0,
@@ -186,6 +187,9 @@ const perf = {
   decoderMs: 0,
   jointCalls: 0,
   decoderCalls: 0,
+  emittedTokens: 0,
+  blankFrames: 0,
+  finalTokenCount: 0,
   maxQueueDepth: 0
 };
 let drainPromise: Promise<void> | undefined;
@@ -308,6 +312,22 @@ function countWords(text: string): number {
   return text ? text.split(/\s+/).filter(Boolean).length : 0;
 }
 
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+  return sorted[index];
+}
+
+function hashText(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 // Single roll-up line for a run so the server log can be pasted wholesale and
 // the timing breakdown read at a glance. realtimeFactor > 1 means we process
 // slower than audio arrives (i.e. we cannot keep up live).
@@ -319,6 +339,9 @@ function logPerfSummary(): void {
     chunks: perf.chunks,
     chunkAudioMs: Math.round(chunkAudioMs),
     avgElapsedMs: Math.round(avgElapsedMs),
+    p50ElapsedMs: percentile(perf.chunkElapsedMs, 50),
+    p95ElapsedMs: percentile(perf.chunkElapsedMs, 95),
+    maxElapsedMs: Math.max(...perf.chunkElapsedMs),
     avgFeatureMs: Math.round(perf.featureMs / perf.chunks),
     avgEncoderMs: Math.round(perf.encoderMs / perf.chunks),
     avgDecodeMs: Math.round(perf.decodeMs / perf.chunks),
@@ -330,6 +353,11 @@ function logPerfSummary(): void {
     msPerDecoderCall: perf.decoderCalls ? Number((perf.decoderMs / perf.decoderCalls).toFixed(2)) : 0,
     realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
     encoderShare: Number((perf.encoderMs / perf.elapsedMs).toFixed(2)),
+    emittedTokens: perf.emittedTokens,
+    blankFrames: perf.blankFrames,
+    finalTokenCount: perf.finalTokenCount,
+    transcriptWords: countWords(transcript),
+    transcriptHash: hashText(transcript),
     maxQueueDepth: perf.maxQueueDepth,
     provider: benchmarkOptions().provider ?? "webgpu"
   });
@@ -406,6 +434,7 @@ function resetRun(): void {
   chunkIndex = 0;
   perf.chunks = 0;
   perf.elapsedMs = 0;
+  perf.chunkElapsedMs = [];
   perf.featureMs = 0;
   perf.encoderMs = 0;
   perf.decodeMs = 0;
@@ -413,6 +442,9 @@ function resetRun(): void {
   perf.decoderMs = 0;
   perf.jointCalls = 0;
   perf.decoderCalls = 0;
+  perf.emittedTokens = 0;
+  perf.blankFrames = 0;
+  perf.finalTokenCount = 0;
   perf.maxQueueDepth = 0;
   renderTranscript("");
   renderQueue();
@@ -492,6 +524,7 @@ async function drainQueue(): Promise<void> {
       const elapsedMs = Math.round(performance.now() - started);
       perf.chunks += 1;
       perf.elapsedMs += elapsedMs;
+      perf.chunkElapsedMs.push(elapsedMs);
       perf.featureMs += progress.featureMs;
       perf.encoderMs += progress.encoderMs;
       perf.decodeMs += progress.decodeMs;
@@ -499,6 +532,9 @@ async function drainQueue(): Promise<void> {
       perf.decoderMs += progress.decoderMs;
       perf.jointCalls += progress.jointCalls;
       perf.decoderCalls += progress.decoderCalls;
+      perf.emittedTokens += progress.emittedTokens;
+      perf.blankFrames += progress.blankFrames;
+      perf.finalTokenCount = progress.tokenCount;
       perf.maxQueueDepth = Math.max(perf.maxQueueDepth, audioQueue.length);
       if (!benchmarkRunning) {
         appendLog(`Chunk ${progress.chunkIndex} complete`, "info", {
@@ -839,7 +875,7 @@ function benchmarkChunkMs(): number[] {
 
 // Run the decoded audio through the currently loaded sessions at one chunk size
 // and return the timing summary for that pass.
-async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Promise<Record<string, number>> {
+async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Promise<Record<string, number | string>> {
   activeChunkSamples = chunkSamples;
   beginStream();
   const passChunker = new ModelChunker(chunkSamples);
@@ -854,14 +890,28 @@ async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Pr
   return {
     chunkMs: Math.round(chunkAudioMs),
     chunks: perf.chunks,
+    totalElapsedMs: Math.round(perf.elapsedMs),
     avgElapsedMs: Math.round(avgElapsedMs),
+    p50ElapsedMs: percentile(perf.chunkElapsedMs, 50),
+    p95ElapsedMs: percentile(perf.chunkElapsedMs, 95),
+    maxElapsedMs: Math.max(0, ...perf.chunkElapsedMs),
     avgFeatureMs: Math.round(perf.featureMs / divisor),
     avgEncoderMs: Math.round(perf.encoderMs / divisor),
     avgDecodeMs: Math.round(perf.decodeMs / divisor),
     avgJointMs: Math.round(perf.jointMs / divisor),
     avgDecoderMs: Math.round(perf.decoderMs / divisor),
+    avgJointCalls: Math.round(perf.jointCalls / divisor),
+    avgDecoderCalls: Math.round(perf.decoderCalls / divisor),
+    totalJointCalls: perf.jointCalls,
+    totalDecoderCalls: perf.decoderCalls,
     msPerJointCall: perf.jointCalls ? Number((perf.jointMs / perf.jointCalls).toFixed(2)) : 0,
     msPerDecoderCall: perf.decoderCalls ? Number((perf.decoderMs / perf.decoderCalls).toFixed(2)) : 0,
+    emittedTokens: perf.emittedTokens,
+    blankFrames: perf.blankFrames,
+    finalTokenCount: perf.finalTokenCount,
+    transcriptChars: transcript.length,
+    transcriptWords: countWords(transcript),
+    transcriptHash: hashText(transcript),
     realtimeFactor: Number((avgElapsedMs / chunkAudioMs).toFixed(2)),
     maxQueueDepth: perf.maxQueueDepth
   };
