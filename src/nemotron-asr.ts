@@ -24,6 +24,9 @@ export interface LoadOptions {
   // Batch greedy joint calls across consecutive blank frames. Defaults on; use
   // ?batchedJoint=0 to compare against the original one-frame-at-a-time loop.
   batchedJoint?: boolean;
+  // Capture the fixed-shape one-frame joint graph with persistent WebGPU
+  // buffers. Defaults off; ?graphCapture=1 enables this experiment.
+  graphCapture?: boolean;
 }
 
 export interface StreamProgress {
@@ -57,6 +60,36 @@ interface SessionBundle {
 }
 
 type SessionOptions = Parameters<typeof ort.InferenceSession.create>[1];
+
+type WebGpuBuffer = {
+  destroy(): void;
+  mapAsync(mode: number, offset?: number, size?: number): Promise<void>;
+  getMappedRange(offset?: number, size?: number): ArrayBuffer;
+  unmap(): void;
+};
+
+type WebGpuDevice = {
+  createBuffer(descriptor: { size: number; usage: number }): WebGpuBuffer;
+  createCommandEncoder(): {
+    copyBufferToBuffer(source: WebGpuBuffer, sourceOffset: number, destination: WebGpuBuffer, destinationOffset: number, size: number): void;
+    finish(): unknown;
+  };
+  queue: {
+    writeBuffer(buffer: WebGpuBuffer, bufferOffset: number, data: ArrayBufferLike, dataOffset?: number, size?: number): void;
+    submit(commandBuffers: unknown[]): void;
+  };
+};
+
+interface CapturedJointBuffers {
+  device: WebGpuDevice;
+  encoderBuffer: WebGpuBuffer;
+  decoderBuffer: WebGpuBuffer;
+  outputBuffer: WebGpuBuffer;
+  readBuffer: WebGpuBuffer;
+  encoderTensor: ort.Tensor;
+  decoderTensor: ort.Tensor;
+  outputTensor: ort.Tensor;
+}
 
 interface EncoderCache {
   channel: ort.Tensor;
@@ -298,6 +331,14 @@ function disposeEncoderCache(cache: EncoderCache): void {
   disposeGpuTensor(cache.channelLen);
 }
 
+function destroyCapturedJointBuffers(buffers?: CapturedJointBuffers): void {
+  if (!buffers) return;
+  buffers.encoderBuffer.destroy();
+  buffers.decoderBuffer.destroy();
+  buffers.outputBuffer.destroy();
+  buffers.readBuffer.destroy();
+}
+
 function readScalarInt(tensor: ort.Tensor): number {
   if (tensor.type === "int64") return Number((tensor.data as BigInt64Array)[0]);
   if (tensor.type === "int32") return (tensor.data as Int32Array)[0];
@@ -356,6 +397,8 @@ export class NemotronBrowserASR {
   private jointCalls = 0;
   private decoderCalls = 0;
   private batchedJoint = true;
+  private jointGraphCapture = false;
+  private capturedJoint?: CapturedJointBuffers;
 
   private biasingEnabled = false;
   private beamSize = 4;
@@ -407,10 +450,16 @@ export class NemotronBrowserASR {
   // rebuilds sessions per backend, so the old ones must be freed first to avoid
   // holding two copies of the ~690 MB encoder.
   async dispose(): Promise<void> {
-    if (!this.sessions) return;
+    if (!this.sessions) {
+      destroyCapturedJointBuffers(this.capturedJoint);
+      this.capturedJoint = undefined;
+      return;
+    }
     const { encoder, decoder, joint } = this.sessions;
     this.sessions = undefined;
     disposeEncoderCache(this.encoderCache);
+    destroyCapturedJointBuffers(this.capturedJoint);
+    this.capturedJoint = undefined;
     await Promise.all([encoder.release(), decoder.release(), joint.release()]);
   }
 
@@ -457,7 +506,8 @@ export class NemotronBrowserASR {
     const decodeProviders: ort.InferenceSession.ExecutionProviderConfig[] = hybrid
       ? ["wasm"]
       : encoderProviders;
-    this.batchedJoint = options.batchedJoint ?? true;
+    this.jointGraphCapture = Boolean(options.graphCapture && provider === "webgpu" && !hybrid);
+    this.batchedJoint = (options.batchedJoint ?? true) && !this.jointGraphCapture;
 
     const cfg = NEMOTRON_CONFIG;
     const encoderSessionOptions: SessionOptions =
@@ -469,6 +519,7 @@ export class NemotronBrowserASR {
             }
           }
         : {};
+    const jointSessionOptions: SessionOptions = this.jointGraphCapture ? { enableGraphCapture: true } : {};
 
     onProgress?.({
       stage: "runtime",
@@ -480,6 +531,8 @@ export class NemotronBrowserASR {
         encoderProviders,
         decodeProviders,
         batchedJoint: this.batchedJoint,
+        graphCapture: this.jointGraphCapture ? "joint" : false,
+        requestedGraphCapture: Boolean(options.graphCapture),
         gpuEncoderCaches: provider === "webgpu",
         profile: Boolean(options.profile),
         crossOriginIsolated: globalThis.crossOriginIsolated,
@@ -494,7 +547,7 @@ export class NemotronBrowserASR {
     const decoder = await createSession(MODEL_FILES.decoder.onnx, MODEL_FILES.decoder.data, decodeProviders, onProgress);
 
     onProgress?.({ stage: "joint", detail: "Loading joint.onnx and joint.onnx.data" });
-    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, decodeProviders, onProgress);
+    const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, decodeProviders, onProgress, jointSessionOptions);
 
     const encoderVariant = options.encoderVariant ?? "int4";
     const encoderFiles = ENCODER_VARIANTS[encoderVariant];
@@ -902,7 +955,97 @@ export class NemotronBrowserASR {
     return new ort.Tensor("float32", data, [1, 1, data.length]);
   }
 
+  private async getCapturedJointBuffers(): Promise<CapturedJointBuffers> {
+    if (this.capturedJoint) return this.capturedJoint;
+    const cfg = NEMOTRON_CONFIG;
+    const device = (await ort.env.webgpu.device) as WebGpuDevice;
+    const webgpuGlobals = globalThis as typeof globalThis & {
+      GPUBufferUsage: { STORAGE: number; COPY_DST: number; COPY_SRC: number; MAP_READ: number };
+      GPUMapMode: { READ: number };
+    };
+    const usage = webgpuGlobals.GPUBufferUsage.STORAGE | webgpuGlobals.GPUBufferUsage.COPY_DST | webgpuGlobals.GPUBufferUsage.COPY_SRC;
+    const encoderBuffer = device.createBuffer({ size: cfg.encoderHiddenSize * 4, usage });
+    const decoderBuffer = device.createBuffer({ size: cfg.decoderHiddenSize * 4, usage });
+    const outputBuffer = device.createBuffer({ size: cfg.vocabSize * 4, usage });
+    const readBuffer = device.createBuffer({
+      size: cfg.vocabSize * 4,
+      usage: webgpuGlobals.GPUBufferUsage.MAP_READ | webgpuGlobals.GPUBufferUsage.COPY_DST
+    });
+    const fromGpuBuffer = ort.Tensor.fromGpuBuffer as unknown as (
+      buffer: WebGpuBuffer,
+      options: { dataType: "float32"; dims: number[] }
+    ) => ort.Tensor;
+
+    this.capturedJoint = {
+      device,
+      encoderBuffer,
+      decoderBuffer,
+      outputBuffer,
+      readBuffer,
+      encoderTensor: fromGpuBuffer(encoderBuffer, {
+        dataType: "float32",
+        dims: [1, 1, cfg.encoderHiddenSize]
+      }),
+      decoderTensor: fromGpuBuffer(decoderBuffer, {
+        dataType: "float32",
+        dims: [1, 1, cfg.decoderHiddenSize]
+      }),
+      outputTensor: fromGpuBuffer(outputBuffer, {
+        dataType: "float32",
+        dims: [1, 1, 1, cfg.vocabSize]
+      })
+    };
+    return this.capturedJoint;
+  }
+
+  private async runCapturedJoint(encoderFrame: ort.Tensor, decoderFrame: ort.Tensor): Promise<ort.Tensor> {
+    if (!this.sessions) throw new Error("Model is not loaded");
+    const cfg = NEMOTRON_CONFIG;
+    if (
+      encoderFrame.dims.length !== 3 ||
+      encoderFrame.dims[1] !== 1 ||
+      encoderFrame.dims[2] !== cfg.encoderHiddenSize ||
+      decoderFrame.dims.length !== 3 ||
+      decoderFrame.dims[1] !== 1 ||
+      decoderFrame.dims[2] !== cfg.decoderHiddenSize
+    ) {
+      return this.runUncapturedJoint(encoderFrame, decoderFrame);
+    }
+
+    const captured = await this.getCapturedJointBuffers();
+    const encoderData = encoderFrame.data as Float32Array;
+    const decoderData = decoderFrame.data as Float32Array;
+    captured.device.queue.writeBuffer(captured.encoderBuffer, 0, encoderData.buffer, encoderData.byteOffset, encoderData.byteLength);
+    captured.device.queue.writeBuffer(captured.decoderBuffer, 0, decoderData.buffer, decoderData.byteOffset, decoderData.byteLength);
+
+    const started = performance.now();
+    await this.sessions.joint.run(
+      {
+        [cfg.inputs.joinerEncoder]: captured.encoderTensor,
+        [cfg.inputs.joinerDecoder]: captured.decoderTensor
+      },
+      {
+        [cfg.outputs.joint]: captured.outputTensor
+      }
+    );
+    const encoder = captured.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(captured.outputBuffer, 0, captured.readBuffer, 0, cfg.vocabSize * 4);
+    captured.device.queue.submit([encoder.finish()]);
+    const gpuMapMode = (globalThis as typeof globalThis & { GPUMapMode: { READ: number } }).GPUMapMode;
+    await captured.readBuffer.mapAsync(gpuMapMode.READ, 0, cfg.vocabSize * 4);
+    const logits = new Float32Array(captured.readBuffer.getMappedRange(0, cfg.vocabSize * 4).slice(0));
+    captured.readBuffer.unmap();
+    this.jointMs += performance.now() - started;
+    this.jointCalls += 1;
+    return new ort.Tensor("float32", logits, [1, 1, 1, cfg.vocabSize]);
+  }
+
   private async runJoint(encoderFrame: ort.Tensor, decoderFrame: ort.Tensor): Promise<ort.Tensor> {
+    if (this.jointGraphCapture) return this.runCapturedJoint(encoderFrame, decoderFrame);
+    return this.runUncapturedJoint(encoderFrame, decoderFrame);
+  }
+
+  private async runUncapturedJoint(encoderFrame: ort.Tensor, decoderFrame: ort.Tensor): Promise<ort.Tensor> {
     if (!this.sessions) throw new Error("Model is not loaded");
     const cfg = NEMOTRON_CONFIG;
     const started = performance.now();

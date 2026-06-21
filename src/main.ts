@@ -574,7 +574,10 @@ function benchmarkOptions(): LoadOptions {
     // ?encoder=fp16 loads the locally-converted fp16 encoder instead of int4.
     encoderVariant: params.get("encoder") === "fp16" ? "fp16" : undefined,
     // ?batchedJoint=0 restores the original one-joint-run-per-frame greedy loop.
-    batchedJoint: params.get("batchedJoint") === "0" ? false : undefined
+    batchedJoint: params.get("batchedJoint") === "0" ? false : undefined,
+    // ?graphCapture=1 captures the fixed-shape one-frame joint session. It
+    // disables batchedJoint internally because capture needs static buffers.
+    graphCapture: params.get("graphCapture") === "1" ? true : undefined
   };
 }
 
@@ -875,8 +878,8 @@ async function runBenchmark(file: File): Promise<void> {
       setDetail(`Loading ${backend.label}`);
       setState();
       const loadStart = performance.now();
-      const { encoderVariant, batchedJoint } = benchmarkOptions();
-      const loadOptions: LoadOptions = { ...backend.options, encoderVariant, batchedJoint };
+      const { encoderVariant, batchedJoint, graphCapture } = benchmarkOptions();
+      const loadOptions: LoadOptions = { ...backend.options, encoderVariant, batchedJoint, graphCapture };
       try {
         await asr.load((progress: LoadProgress) => {
           setDetail(`${backend.label}: ${progress.detail ?? progress.stage}`);
