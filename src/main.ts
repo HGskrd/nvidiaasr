@@ -765,13 +765,30 @@ async function processAudioFile(file: File): Promise<void> {
   }
 }
 
-// Backend configurations swept by the benchmark. Each one rebuilds the ONNX
-// sessions (the expensive step), so they are the outer loop; chunk sizes re-run
-// the same sessions and are the inner loop.
-const BENCHMARK_BACKENDS: { label: string; options: LoadOptions }[] = [
-  { label: "Hybrid WebGPU (encoder webgpu / decode wasm)", options: { provider: "webgpu", hybrid: true } },
-  { label: "Pure WebGPU", options: { provider: "webgpu", hybrid: false } },
-  { label: "Pure WASM", options: { provider: "wasm" } }
+// Benchmark cases matching the manual URLs we compare on weak GPUs. Each case
+// rebuilds ONNX sessions, so they are the outer loop; chunk sizes re-run the
+// same sessions and are the inner loop.
+const BENCHMARK_CASES: { key: string; label: string; options: LoadOptions }[] = [
+  {
+    key: "default",
+    label: "Default WebGPU (batched joint)",
+    options: { provider: "webgpu", hybrid: false, batchedJoint: true, graphCapture: false }
+  },
+  {
+    key: "stepwise",
+    label: "WebGPU stepwise joint (?batchedJoint=0)",
+    options: { provider: "webgpu", hybrid: false, batchedJoint: false, graphCapture: false }
+  },
+  {
+    key: "graphcapture",
+    label: "WebGPU joint graph capture (?graphCapture=1)",
+    options: { provider: "webgpu", hybrid: false, batchedJoint: false, graphCapture: true }
+  },
+  {
+    key: "hybrid",
+    label: "Hybrid WebGPU encoder / WASM decode (?hybrid=1)",
+    options: { provider: "webgpu", hybrid: true, batchedJoint: true, graphCapture: false }
+  }
 ];
 
 // Chunk sizes (ms of audio) tried for every backend. The encoder was exported
@@ -786,21 +803,28 @@ function chunkSamplesForMs(ms: number): number {
 }
 
 // URL overrides so the matrix can be trimmed without a rebuild, e.g.
-// ?benchBackends=webgpu,hybrid (skip the slow Pure WASM pass) or
-// ?benchChunks=560,280 (only meaningful once the encoder is re-exported).
-function benchmarkBackends(): typeof BENCHMARK_BACKENDS {
-  const param = new URLSearchParams(window.location.search).get("benchBackends");
-  if (!param) return BENCHMARK_BACKENDS;
-  const byKey: Record<string, (typeof BENCHMARK_BACKENDS)[number]> = {
-    hybrid: BENCHMARK_BACKENDS[0],
-    webgpu: BENCHMARK_BACKENDS[1],
-    wasm: BENCHMARK_BACKENDS[2]
+// ?benchCases=default,graphcapture or ?benchChunks=560,280 (only meaningful
+// once the encoder is re-exported).
+function benchmarkCases(): typeof BENCHMARK_CASES {
+  const params = new URLSearchParams(window.location.search);
+  const param = params.get("benchCases") ?? params.get("benchBackends");
+  if (!param) return BENCHMARK_CASES;
+  const byKey: Record<string, (typeof BENCHMARK_CASES)[number]> = {
+    default: BENCHMARK_CASES[0],
+    webgpu: BENCHMARK_CASES[0],
+    batched: BENCHMARK_CASES[0],
+    stepwise: BENCHMARK_CASES[1],
+    unbatched: BENCHMARK_CASES[1],
+    graph: BENCHMARK_CASES[2],
+    graphcapture: BENCHMARK_CASES[2],
+    capture: BENCHMARK_CASES[2],
+    hybrid: BENCHMARK_CASES[3]
   };
   const chosen = param
     .split(",")
     .map((key) => byKey[key.trim().toLowerCase()])
-    .filter((entry): entry is (typeof BENCHMARK_BACKENDS)[number] => Boolean(entry));
-  return chosen.length ? chosen : BENCHMARK_BACKENDS;
+    .filter((entry): entry is (typeof BENCHMARK_CASES)[number] => Boolean(entry));
+  return chosen.length ? chosen : BENCHMARK_CASES;
 }
 
 function benchmarkChunkMs(): number[] {
@@ -857,13 +881,13 @@ async function runBenchmark(file: File): Promise<void> {
   const startedAt = performance.now();
   try {
     await applyBiasing();
-    const backends = benchmarkBackends();
+    const cases = benchmarkCases();
     const chunkMsList = benchmarkChunkMs();
     setStatus("busy", "benchmarking");
     setDetail(`Benchmarking ${file.name}`);
     refreshControls();
     appendLog(`Benchmark started for ${file.name}`, "info", {
-      backends: backends.map((b) => b.label),
+      cases: cases.map((b) => b.label),
       chunkMs: chunkMsList,
       bytes: file.size
     });
@@ -874,34 +898,34 @@ async function runBenchmark(file: File): Promise<void> {
       durationSeconds: Number((samples.length / NEMOTRON_CONFIG.sampleRate).toFixed(2))
     });
 
-    for (const backend of backends) {
-      setDetail(`Loading ${backend.label}`);
+    for (const benchCase of cases) {
+      setDetail(`Loading ${benchCase.label}`);
       setState();
       const loadStart = performance.now();
-      const { encoderVariant, batchedJoint, graphCapture } = benchmarkOptions();
-      const loadOptions: LoadOptions = { ...backend.options, encoderVariant, batchedJoint, graphCapture };
+      const { encoderVariant, profile } = benchmarkOptions();
+      const loadOptions: LoadOptions = { ...benchCase.options, encoderVariant, profile };
       try {
         await asr.load((progress: LoadProgress) => {
-          setDetail(`${backend.label}: ${progress.detail ?? progress.stage}`);
+          setDetail(`${benchCase.label}: ${progress.detail ?? progress.stage}`);
         }, loadOptions);
       } catch (error) {
-        appendErrorLog(`Benchmark: failed to load ${backend.label}`, error);
-        results.push({ backend: backend.label, status: "load failed", error: errorMessage(error) });
+        appendErrorLog(`Benchmark: failed to load ${benchCase.label}`, error);
+        results.push({ case: benchCase.key, backend: benchCase.label, status: "load failed", error: errorMessage(error) });
         continue;
       }
       const loadMs = Math.round(performance.now() - loadStart);
-      appendLog(`Benchmark: loaded ${backend.label}`, "info", { ...loadOptions, loadMs });
+      appendLog(`Benchmark: loaded ${benchCase.label}`, "info", { case: benchCase.key, ...loadOptions, loadMs });
 
       for (const chunkMs of chunkMsList) {
-        setDetail(`${backend.label} @ ${chunkMs} ms chunks`);
+        setDetail(`${benchCase.label} @ ${chunkMs} ms chunks`);
         try {
           const summary = await runBenchmarkPass(samples, chunkSamplesForMs(chunkMs));
-          const row = { backend: backend.label, status: "ok", loadMs, ...summary };
+          const row = { case: benchCase.key, backend: benchCase.label, status: "ok", loadMs, ...summary };
           results.push(row);
-          appendLog(`Benchmark: ${backend.label} @ ${chunkMs} ms`, "info", row);
+          appendLog(`Benchmark: ${benchCase.label} @ ${chunkMs} ms`, "info", row);
         } catch (error) {
-          appendErrorLog(`Benchmark: run failed for ${backend.label} @ ${chunkMs} ms`, error);
-          results.push({ backend: backend.label, chunkMs, status: "run failed", error: errorMessage(error) });
+          appendErrorLog(`Benchmark: run failed for ${benchCase.label} @ ${chunkMs} ms`, error);
+          results.push({ case: benchCase.key, backend: benchCase.label, chunkMs, status: "run failed", error: errorMessage(error) });
         }
       }
     }
