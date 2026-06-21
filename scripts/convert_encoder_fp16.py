@@ -94,7 +94,15 @@ def dequantize_matmulnbits(
     return np.ascontiguousarray(deq.T)               # [K, N] for A[M,K] @ W[K,N]
 
 
-def convert(model: onnx.ModelProto) -> int:
+def convert(model: onnx.ModelProto, fp16: bool) -> int:
+    """Replace each MatMulNBits with a dequantized MatMul.
+
+    With fp16=True the matmul runs in fp16 — the weight initializer is stored as
+    fp16 and the activation is cast to fp16 on the way in and back to fp32 on the
+    way out, so only the heavy matmul is half-precision and every graph interface
+    stays fp32 (no JS changes, no fragile whole-graph cast). With fp16=False the
+    weights are plain fp32 (un-quantized; ~2x larger again, mainly a sanity test).
+    """
     graph = model.graph
     inits = {init.name: init for init in graph.initializer}
     replaced = 0
@@ -111,6 +119,7 @@ def convert(model: onnx.ModelProto) -> int:
         block_size = int(_attr(node, "block_size"))
 
         a_name = node.input[0]
+        out_name = node.output[0]
         b = numpy_helper.to_array(inits[node.input[1]])
         scales = numpy_helper.to_array(inits[node.input[2]])
         zero_points = (
@@ -120,11 +129,17 @@ def convert(model: onnx.ModelProto) -> int:
         )
 
         weight = dequantize_matmulnbits(b, scales, zero_points, k, n, bits, block_size)
-        w_name = f"{node.output[0]}_dequant_W"
-        graph.initializer.append(numpy_helper.from_array(weight, name=w_name))
-        new_nodes.append(
-            helper.make_node("MatMul", [a_name, w_name], [node.output[0]], name=f"{node.name}_dq")
-        )
+        w_name = f"{out_name}_dequant_W"
+
+        if fp16:
+            graph.initializer.append(numpy_helper.from_array(weight.astype(np.float16), name=w_name))
+            a16, y16 = f"{out_name}_a16", f"{out_name}_y16"
+            new_nodes.append(helper.make_node("Cast", [a_name], [a16], to=TensorProto.FLOAT16, name=f"{node.name}_castA"))
+            new_nodes.append(helper.make_node("MatMul", [a16, w_name], [y16], name=f"{node.name}_mm16"))
+            new_nodes.append(helper.make_node("Cast", [y16], [out_name], to=TensorProto.FLOAT, name=f"{node.name}_castY"))
+        else:
+            graph.initializer.append(numpy_helper.from_array(weight, name=w_name))
+            new_nodes.append(helper.make_node("MatMul", [a_name, w_name], [out_name], name=f"{node.name}_dq"))
         replaced += 1
 
     del graph.node[:]
@@ -142,16 +157,10 @@ def main() -> None:
 
     print(f"loading {args.inp} ...")
     model = onnx.load(args.inp, load_external_data=True)
-    replaced = convert(model)
-    print(f"replaced {replaced} MatMulNBits node(s) with dequantized MatMul")
+    replaced = convert(model, fp16=args.fp16)
+    kind = "fp16-compute" if args.fp16 else "fp32"
+    print(f"replaced {replaced} MatMulNBits node(s) with {kind} MatMul")
 
-    if args.fp16:
-        from onnxconverter_common import float16
-
-        print("casting graph to fp16 (keep_io_types=True) ...")
-        model = float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True)
-
-    onnx.checker.check_model(model)
     data_file = os.path.basename(args.out) + ".data"
     onnx.save_model(
         model,

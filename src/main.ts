@@ -570,7 +570,11 @@ function benchmarkOptions(): LoadOptions {
     profile: params.get("profile") === "1",
     // Hybrid (decoder/joint on WASM) is off by default — it lost to pure WebGPU
     // on the AMD APU while WASM was single-threaded. ?hybrid=1 opts back in.
-    hybrid: params.get("hybrid") === "1" ? true : undefined
+    hybrid: params.get("hybrid") === "1" ? true : undefined,
+    // ?encoder=fp16 loads the locally-converted fp16 encoder instead of int4.
+    encoderVariant: params.get("encoder") === "fp16" ? "fp16" : undefined,
+    // ?batchedJoint=0 restores the original one-joint-run-per-frame greedy loop.
+    batchedJoint: params.get("batchedJoint") === "0" ? false : undefined
   };
 }
 
@@ -871,17 +875,19 @@ async function runBenchmark(file: File): Promise<void> {
       setDetail(`Loading ${backend.label}`);
       setState();
       const loadStart = performance.now();
+      const { encoderVariant, batchedJoint } = benchmarkOptions();
+      const loadOptions: LoadOptions = { ...backend.options, encoderVariant, batchedJoint };
       try {
         await asr.load((progress: LoadProgress) => {
           setDetail(`${backend.label}: ${progress.detail ?? progress.stage}`);
-        }, backend.options);
+        }, loadOptions);
       } catch (error) {
         appendErrorLog(`Benchmark: failed to load ${backend.label}`, error);
         results.push({ backend: backend.label, status: "load failed", error: errorMessage(error) });
         continue;
       }
       const loadMs = Math.round(performance.now() - loadStart);
-      appendLog(`Benchmark: loaded ${backend.label}`, "info", { ...backend.options, loadMs });
+      appendLog(`Benchmark: loaded ${backend.label}`, "info", { ...loadOptions, loadMs });
 
       for (const chunkMs of chunkMsList) {
         setDetail(`${backend.label} @ ${chunkMs} ms chunks`);

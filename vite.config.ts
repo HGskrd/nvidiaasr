@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig, type Connect, type Plugin, type ViteDevServer } from "vite";
 import { adminPlugin } from "./server/admin-plugin";
 import {
+  ENCODER_VARIANTS,
   hfUrl,
   MODEL_ASSET_PATH,
   MODEL_FILES,
@@ -25,11 +26,13 @@ const modelCacheDir = path.join(
 );
 const ortDistDir = path.join(projectRoot, "node_modules", "onnxruntime-web", "dist");
 
-const modelFileNames = new Set(
-  Object.values(MODEL_FILES)
+const modelFileNames = new Set([
+  ...Object.values(MODEL_FILES)
     .flatMap((group) => Object.values(group))
-    .filter((value): value is string => typeof value === "string")
-);
+    .filter((value): value is string => typeof value === "string"),
+  // Locally-converted encoder variants (fp16); served from cache, no HF source.
+  ...Object.values(ENCODER_VARIANTS).flatMap((variant) => [variant.onnx, variant.data])
+]);
 const ortRuntimeFiles = new Set([
   "ort-wasm-simd-threaded.jsep.mjs",
   "ort-wasm-simd-threaded.jsep.wasm",
@@ -169,9 +172,18 @@ function modelCachePlugin(): Plugin {
   };
 }
 
+const isolationHeaders = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp"
+};
+
 export default defineConfig({
+  server: {
+    headers: isolationHeaders
+  },
   preview: {
-    allowedHosts: ["asr.gskrd.me"]
+    allowedHosts: ["asr.gskrd.me"],
+    headers: isolationHeaders
   },
   plugins: [modelCachePlugin(), adminPlugin()]
 });

@@ -2,7 +2,7 @@ import * as ort from "onnxruntime-web/webgpu";
 import { StreamingFeatureBuilder } from "./audio";
 import { detectWasmSimd } from "./diagnostics";
 import { ContextGraph, ContextNode, logSoftmax, topTokens } from "./context-biasing";
-import { modelAssetUrls, MODEL_FILES, MODEL_REVISION, NEMOTRON_CONFIG, ORT_RUNTIME_PATH } from "./model-config";
+import { ENCODER_VARIANTS, EncoderVariant, modelAssetUrls, MODEL_FILES, MODEL_REVISION, NEMOTRON_CONFIG, ORT_RUNTIME_PATH } from "./model-config";
 import { NemotronTokenizer } from "./tokenizer";
 
 export interface LoadProgress {
@@ -17,9 +17,13 @@ export interface LoadOptions {
   provider?: "webgpu" | "wasm";
   profile?: boolean;
   // Run the small decoder/joint sessions on WASM while the encoder stays on
-  // WebGPU. Defaults on; set false (?hybrid=0) to keep every session on the
-  // chosen provider for an A/B comparison.
+  // WebGPU. Defaults off; ?hybrid=1 opts into the A/B comparison.
   hybrid?: boolean;
+  // Encoder precision: "int4" (shipped default) or "fp16" (locally converted).
+  encoderVariant?: EncoderVariant;
+  // Batch greedy joint calls across consecutive blank frames. Defaults on; use
+  // ?batchedJoint=0 to compare against the original one-frame-at-a-time loop.
+  batchedJoint?: boolean;
 }
 
 export interface StreamProgress {
@@ -51,6 +55,8 @@ interface SessionBundle {
   decoder: ort.InferenceSession;
   joint: ort.InferenceSession;
 }
+
+type SessionOptions = Parameters<typeof ort.InferenceSession.create>[1];
 
 interface EncoderCache {
   channel: ort.Tensor;
@@ -98,7 +104,8 @@ async function createSession(
   modelFile: string,
   externalDataFile: string,
   executionProviders: ort.InferenceSession.ExecutionProviderConfig[],
-  onProgress?: (progress: LoadProgress) => void
+  onProgress?: (progress: LoadProgress) => void,
+  sessionOptions: SessionOptions = {}
 ): Promise<ort.InferenceSession> {
   const modelData = await fetchModelFile(modelFile, onProgress);
   const externalData = await fetchModelFile(externalDataFile, onProgress);
@@ -114,7 +121,8 @@ async function createSession(
     const session = await ort.InferenceSession.create(modelData, {
       executionProviders,
       graphOptimizationLevel: "all",
-      externalData: [{ path: externalDataFile, data: externalData }]
+      externalData: [{ path: externalDataFile, data: externalData }],
+      ...sessionOptions
     });
     onProgress?.({
       stage: "session",
@@ -280,6 +288,16 @@ function createDecoderState(): DecoderState {
   };
 }
 
+function disposeGpuTensor(tensor: ort.Tensor): void {
+  if (tensor.location === "gpu-buffer") tensor.dispose();
+}
+
+function disposeEncoderCache(cache: EncoderCache): void {
+  disposeGpuTensor(cache.channel);
+  disposeGpuTensor(cache.time);
+  disposeGpuTensor(cache.channelLen);
+}
+
 function readScalarInt(tensor: ort.Tensor): number {
   if (tensor.type === "int64") return Number((tensor.data as BigInt64Array)[0]);
   if (tensor.type === "int32") return (tensor.data as Int32Array)[0];
@@ -288,10 +306,15 @@ function readScalarInt(tensor: ort.Tensor): number {
 
 function argmaxWithBlankPenalty(logits: Float32Array): number {
   const cfg = NEMOTRON_CONFIG;
+  return argmaxWithBlankPenaltyAt(logits, 0, cfg.vocabSize);
+}
+
+function argmaxWithBlankPenaltyAt(logits: Float32Array, start: number, length: number): number {
+  const cfg = NEMOTRON_CONFIG;
   let best = 0;
-  let bestScore = logits[0];
-  for (let i = 1; i < logits.length; i++) {
-    const score = i === cfg.blankId ? logits[i] - cfg.blankPenalty : logits[i];
+  let bestScore = logits[start];
+  for (let i = 1; i < length; i++) {
+    const score = i === cfg.blankId ? logits[start + i] - cfg.blankPenalty : logits[start + i];
     if (score > bestScore) {
       bestScore = score;
       best = i;
@@ -332,6 +355,7 @@ export class NemotronBrowserASR {
   private decoderMs = 0;
   private jointCalls = 0;
   private decoderCalls = 0;
+  private batchedJoint = true;
 
   private biasingEnabled = false;
   private beamSize = 4;
@@ -386,6 +410,7 @@ export class NemotronBrowserASR {
     if (!this.sessions) return;
     const { encoder, decoder, joint } = this.sessions;
     this.sessions = undefined;
+    disposeEncoderCache(this.encoderCache);
     await Promise.all([encoder.release(), decoder.release(), joint.release()]);
   }
 
@@ -432,6 +457,18 @@ export class NemotronBrowserASR {
     const decodeProviders: ort.InferenceSession.ExecutionProviderConfig[] = hybrid
       ? ["wasm"]
       : encoderProviders;
+    this.batchedJoint = options.batchedJoint ?? true;
+
+    const cfg = NEMOTRON_CONFIG;
+    const encoderSessionOptions: SessionOptions =
+      provider === "webgpu"
+        ? {
+            preferredOutputLocation: {
+              [cfg.outputs.cacheLastChannel]: "gpu-buffer",
+              [cfg.outputs.cacheLastTime]: "gpu-buffer"
+            }
+          }
+        : {};
 
     onProgress?.({
       stage: "runtime",
@@ -439,8 +476,11 @@ export class NemotronBrowserASR {
       data: {
         provider,
         hybrid,
+        encoderVariant: options.encoderVariant ?? "int4",
         encoderProviders,
         decodeProviders,
+        batchedJoint: this.batchedJoint,
+        gpuEncoderCaches: provider === "webgpu",
         profile: Boolean(options.profile),
         crossOriginIsolated: globalThis.crossOriginIsolated,
         wasmThreads: ort.env.wasm.numThreads,
@@ -456,14 +496,17 @@ export class NemotronBrowserASR {
     onProgress?.({ stage: "joint", detail: "Loading joint.onnx and joint.onnx.data" });
     const joint = await createSession(MODEL_FILES.joint.onnx, MODEL_FILES.joint.data, decodeProviders, onProgress);
 
-    onProgress?.({ stage: "encoder", detail: "Loading encoder.onnx and encoder.onnx.data" });
-    const encoder = await createSession(MODEL_FILES.encoder.onnx, MODEL_FILES.encoder.data, encoderProviders, onProgress);
+    const encoderVariant = options.encoderVariant ?? "int4";
+    const encoderFiles = ENCODER_VARIANTS[encoderVariant];
+    onProgress?.({ stage: "encoder", detail: `Loading ${encoderFiles.onnx} and ${encoderFiles.data}`, data: { encoderVariant } });
+    const encoder = await createSession(encoderFiles.onnx, encoderFiles.data, encoderProviders, onProgress, encoderSessionOptions);
 
     this.sessions = { encoder, decoder, joint };
     onProgress?.({ stage: "ready", detail: "All ONNX sessions loaded" });
   }
 
   reset(): void {
+    disposeEncoderCache(this.encoderCache);
     this.encoderCache = createEncoderCache();
     this.decoderState = createDecoderState();
     this.featureBuilder.reset();
@@ -544,6 +587,7 @@ export class NemotronBrowserASR {
     };
 
     const encoderStart = performance.now();
+    const previousEncoderCache = this.encoderCache;
     const encoderOutputs = await this.sessions.encoder.run(encoderFeeds);
     const encoderMs = performance.now() - encoderStart;
     const encoded = encoderOutputs[cfg.outputs.encoder];
@@ -553,6 +597,7 @@ export class NemotronBrowserASR {
       time: encoderOutputs[cfg.outputs.cacheLastTime],
       channelLen: encoderOutputs[cfg.outputs.cacheLastChannelLen]
     };
+    disposeEncoderCache(previousEncoderCache);
 
     this.jointMs = 0;
     this.decoderMs = 0;
@@ -579,6 +624,14 @@ export class NemotronBrowserASR {
   }
 
   private async decodeEncodedFrames(
+    encoded: ort.Tensor,
+    encodedLen: number
+  ): Promise<{ emittedTokens: number; blankFrames: number; topToken: number; topScore: number; blankScore: number }> {
+    if (this.batchedJoint) return this.decodeEncodedFramesBatchedJoint(encoded, encodedLen);
+    return this.decodeEncodedFramesStepwise(encoded, encodedLen);
+  }
+
+  private async decodeEncodedFramesStepwise(
     encoded: ort.Tensor,
     encodedLen: number
   ): Promise<{ emittedTokens: number; blankFrames: number; topToken: number; topScore: number; blankScore: number }> {
@@ -626,6 +679,76 @@ export class NemotronBrowserASR {
         timeStep++;
         symbolStep = 0;
       }
+    }
+
+    return { emittedTokens, blankFrames, topToken, topScore, blankScore };
+  }
+
+  private async decodeEncodedFramesBatchedJoint(
+    encoded: ort.Tensor,
+    encodedLen: number
+  ): Promise<{ emittedTokens: number; blankFrames: number; topToken: number; topScore: number; blankScore: number }> {
+    const cfg = NEMOTRON_CONFIG;
+    const shape = encoded.dims;
+    if (shape.length !== 3) throw new Error(`Expected encoder output rank 3, got ${shape.join("x")}`);
+    const timeSteps = Math.min(shape[1], encodedLen);
+    const hidden = shape[2];
+    const encodedData = encoded.data as Float32Array;
+    let timeStep = 0;
+    let symbolStep = 0;
+    let emittedTokens = 0;
+    let blankFrames = 0;
+    let topToken: number = cfg.blankId;
+    let topScore = Number.NEGATIVE_INFINITY;
+    let blankScore = Number.NEGATIVE_INFINITY;
+
+    while (timeStep < timeSteps) {
+      const decoderOutput = await this.currentDecoderOutput();
+      const remainingSteps = timeSteps - timeStep;
+      const start = timeStep * hidden;
+      const frames = new ort.Tensor(
+        "float32",
+        encodedData.slice(start, start + remainingSteps * hidden),
+        [1, remainingSteps, hidden]
+      );
+      const logits = await this.runJoint(frames, this.asDecoderFrame(decoderOutput));
+      const logitsData = logits.data as Float32Array;
+      let usedWholeBatch = true;
+
+      for (let offset = 0; offset < remainingSteps; offset++) {
+        const rowStart = offset * cfg.vocabSize;
+        const best = argmaxWithBlankPenaltyAt(logitsData, rowStart, cfg.vocabSize);
+        topToken = best;
+        topScore = logitsData[rowStart + best] ?? Number.NEGATIVE_INFINITY;
+        blankScore = logitsData[rowStart + cfg.blankId] ?? Number.NEGATIVE_INFINITY;
+
+        if (best === cfg.blankId) {
+          blankFrames++;
+          timeStep++;
+          symbolStep = 0;
+          continue;
+        }
+
+        this.decoderState.lastToken = best;
+        this.decoderState.hidden = decoderOutput.hidden;
+        this.decoderState.cell = decoderOutput.cell;
+        this.decoderOutputCache = undefined;
+        this.tokens.push(best);
+        emittedTokens++;
+
+        symbolStep++;
+        if (symbolStep >= cfg.maxSymbolsPerStep) {
+          timeStep++;
+          symbolStep = 0;
+        }
+
+        // The decoder state changed, so the rest of this batched joint output is
+        // stale. Re-run joint from the current frame with the new decoder state.
+        usedWholeBatch = false;
+        break;
+      }
+
+      if (usedWholeBatch) break;
     }
 
     return { emittedTokens, blankFrames, topToken, topScore, blankScore };

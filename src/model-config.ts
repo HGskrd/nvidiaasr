@@ -25,6 +25,17 @@ export const MODEL_FILES = {
   }
 } as const;
 
+// Encoder precision variants. int4 is what onnx-community ships; fp16 is
+// produced locally by scripts/convert_encoder_fp16.py (dequantized int4 → fp16
+// matmuls) and must be placed in the model cache — there is no HF source. Used
+// to A/B whether native fp16 beats on-the-fly int4 dequant on a weak iGPU.
+export const ENCODER_VARIANTS = {
+  int4: { onnx: "encoder.onnx", data: "encoder.onnx.data" },
+  fp16: { onnx: "encoder.fp16.onnx", data: "encoder.fp16.onnx.data" }
+} as const;
+
+export type EncoderVariant = keyof typeof ENCODER_VARIANTS;
+
 export const NEMOTRON_CONFIG = {
   vocabSize: 13_088,
   blankId: 13_087,
@@ -125,7 +136,7 @@ export function modelAssetUrl(filename: string): string {
 }
 
 export function modelAssetUrls(filename: string): string[] {
-  return [hfUrl(filename), modelAssetUrl(filename)];
+  return [modelAssetUrl(filename), hfUrl(filename)];
 }
 
 export function formatBytes(bytes: number): string {
