@@ -319,6 +319,11 @@ function percentile(values: number[], p: number): number {
   return sorted[index];
 }
 
+function average(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
 function hashText(text: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
@@ -335,13 +340,23 @@ function logPerfSummary(): void {
   if (perf.chunks === 0) return;
   const chunkAudioMs = (activeChunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
   const avgElapsedMs = perf.elapsedMs / perf.chunks;
+  const steadyChunkMs = perf.chunkElapsedMs.slice(1);
+  const steadyAvgElapsedMs = average(steadyChunkMs);
   appendLog("Performance summary", "info", {
     chunks: perf.chunks,
     chunkAudioMs: Math.round(chunkAudioMs),
+    firstChunkElapsedMs: perf.chunkElapsedMs[0] ?? 0,
     avgElapsedMs: Math.round(avgElapsedMs),
     p50ElapsedMs: percentile(perf.chunkElapsedMs, 50),
     p95ElapsedMs: percentile(perf.chunkElapsedMs, 95),
     maxElapsedMs: Math.max(...perf.chunkElapsedMs),
+    slowChunks: perf.chunkElapsedMs.filter((value) => value > chunkAudioMs).length,
+    steadyChunks: steadyChunkMs.length,
+    steadyAvgElapsedMs: Math.round(steadyAvgElapsedMs),
+    steadyP95ElapsedMs: percentile(steadyChunkMs, 95),
+    steadyMaxElapsedMs: Math.max(0, ...steadyChunkMs),
+    steadyRealtimeFactor: steadyChunkMs.length ? Number((steadyAvgElapsedMs / chunkAudioMs).toFixed(2)) : 0,
+    steadySlowChunks: steadyChunkMs.filter((value) => value > chunkAudioMs).length,
     avgFeatureMs: Math.round(perf.featureMs / perf.chunks),
     avgEncoderMs: Math.round(perf.encoderMs / perf.chunks),
     avgDecodeMs: Math.round(perf.decodeMs / perf.chunks),
@@ -887,14 +902,24 @@ async function runBenchmarkPass(samples: Float32Array, chunkSamples: number): Pr
   const chunkAudioMs = (chunkSamples / NEMOTRON_CONFIG.sampleRate) * 1000;
   const divisor = Math.max(1, perf.chunks);
   const avgElapsedMs = perf.elapsedMs / divisor;
+  const steadyChunkMs = perf.chunkElapsedMs.slice(1);
+  const steadyAvgElapsedMs = average(steadyChunkMs);
   return {
     chunkMs: Math.round(chunkAudioMs),
     chunks: perf.chunks,
     totalElapsedMs: Math.round(perf.elapsedMs),
+    firstChunkElapsedMs: perf.chunkElapsedMs[0] ?? 0,
     avgElapsedMs: Math.round(avgElapsedMs),
     p50ElapsedMs: percentile(perf.chunkElapsedMs, 50),
     p95ElapsedMs: percentile(perf.chunkElapsedMs, 95),
     maxElapsedMs: Math.max(0, ...perf.chunkElapsedMs),
+    slowChunks: perf.chunkElapsedMs.filter((value) => value > chunkAudioMs).length,
+    steadyChunks: steadyChunkMs.length,
+    steadyAvgElapsedMs: Math.round(steadyAvgElapsedMs),
+    steadyP95ElapsedMs: percentile(steadyChunkMs, 95),
+    steadyMaxElapsedMs: Math.max(0, ...steadyChunkMs),
+    steadyRealtimeFactor: steadyChunkMs.length ? Number((steadyAvgElapsedMs / chunkAudioMs).toFixed(2)) : 0,
+    steadySlowChunks: steadyChunkMs.filter((value) => value > chunkAudioMs).length,
     avgFeatureMs: Math.round(perf.featureMs / divisor),
     avgEncoderMs: Math.round(perf.encoderMs / divisor),
     avgDecodeMs: Math.round(perf.decodeMs / divisor),
